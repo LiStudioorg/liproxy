@@ -1,0 +1,75 @@
+# https://editorconfig.org
+# Keep this file in sync with the formatters wired into `make fmt`:
+# gofumpt for Go, Prettier for the frontend, shfmt for shell scripts.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# --- Go ---
+[*.go]
+indent_style = tab
+indent_size = 4
+
+[go.mod]
+indent_style = tab
+indent_size = 4
+
+[go.sum]
+indent_style = tab
+indent_size = 4
+
+# --- Frontend ---
+[*.{ts,tsx,js,jsx,mjs,cjs}]
+indent_size = 2
+
+[*.vue]
+indent_size = 2
+
+[*.{json,jsonc}]
+indent_size = 2
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[*.{css,scss}]
+indent_size = 2
+
+[*.html]
+indent_size = 2
+
+# --- Docs ---
+[*.md]
+# Trailing whitespace is meaningful in Markdown (hard line break).
+trim_trailing_whitespace = false
+
+# --- Build / config ---
+[Makefile]
+indent_style = tab
+indent_size = 4
+
+[*.mk]
+indent_style = tab
+indent_size = 4
+
+[*.{toml,ini}]
+indent_size = 2
+
+[*.sql]
+indent_size = 2
+
+[*.sh]
+indent_size = 2
+switch_case_indent = true
+
+[LICENSE]
+insert_final_newline = true
+# The AGPL-3.0 text must stay byte-for-byte verbatim; editors must not
+# reflow or trim it.
+trim_trailing_whitespace = false

@@ -10,7 +10,7 @@
 
 ## 1. 项目概述
 
-LiProxy 是一个用 Go 1.22+ 编写的、Web 驱动的全能代理平台。它把"客户端代理"（对齐 Mihomo 的能力面）和"服务端代理"（对齐 sing-box 的能力面）合并进单个二进制，并用内嵌的 React Web 界面取代传统的手写 YAML 配置流程。
+LiProxy 是一个用 Go 1.22+ 编写的、Web 驱动的全能代理平台。它把"客户端代理"（对齐 Mihomo 的能力面）和"服务端代理"（对齐 sing-box 的能力面）合并进单个二进制，并用内嵌的 Vue 3 Web 界面取代传统的手写 YAML 配置流程。
 
 **关键定位（三句话）：**
 
@@ -28,9 +28,11 @@ LiProxy 是一个用 Go 1.22+ 编写的、Web 驱动的全能代理平台。它�
 | 精简版二进制体积 | ≈ 8 MB |
 | 外部运行时依赖 | 0（纯 Go SQLite，无 CGO） |
 
-**模块路径**：`github.com/liproxy/liproxy`
+**模块路径**：`github.com/LiStudioorg/liproxy`
+**仓库地址**：`https://github.com/LiStudioorg/liproxy`
 **主二进制**：`lipd`（守护进程）
 **CLI**：`lip`
+**License**：AGPL-3.0（见第 18 节）
 
 ---
 
@@ -38,7 +40,7 @@ LiProxy 是一个用 Go 1.22+ 编写的、Web 驱动的全能代理平台。它�
 
 ```text
 ┌────────────────────────────────────────────────────────────────────┐
-│                          Browser (React SPA)                       │
+│                          Browser (Vue 3 SPA)                        │
 │   TanStack Query  ──  REST /api/v1/*        WS /api/v1/ws          │
 └───────────────────────────────┬────────────────────────────────────┘
                                 │  HTTP / WebSocket
@@ -126,13 +128,15 @@ liproxy/
 │   ├── auth/                    # JWT、Refresh Token、API Key、密码哈希
 │   ├── engine/                  # 运行时引擎：加载 IR、构建实例、热重载、统计上报
 │   └── relay/                   # 转发核心：双向拷贝、splice 零拷贝、超时与统计
-├── web/                         # 前端：React 18 + TS + Vite（构建产物嵌入二进制）
+├── web/                         # 前端：Vue 3 + TS + Vite（构建产物 web/dist 嵌入二进制，见第 19 节）
+│   ├── embed.go                 # 唯一持有 //go:embed all:dist 的 Go 文件
+│   ├── dist/                    # 前端构建产物（生成物，不入库；仅保留占位 index.html）
 │   ├── src/
 │   │   ├── pages/               # 页面级组件，与路由一一对应
-│   │   ├── components/          # 复用组件，shadcn/ui 基础组件在 components/ui/
+│   │   ├── components/          # 复用组件，shadcn-vue 基础组件在 components/ui/
 │   │   ├── api/                 # 后端接口封装（统一走封装的 fetch 客户端）
-│   │   ├── stores/              # Zustand 全局状态（仅放跨页面状态）
-│   │   └── hooks/               # 自定义 hooks（TanStack Query 封装）
+│   │   ├── stores/              # Pinia 全局状态（仅放跨页面状态）
+│   │   └── composables/         # 组合式函数（TanStack Query 封装）
 │   └── public/                  # 静态资源与 PWA manifest
 ├── pkg/
 │   ├── bufpool/                 # 分级 buffer pool
@@ -141,6 +145,7 @@ liproxy/
 │   └── version/                 # 版本号、commit、构建时间（ldflags 注入）
 ├── docs/                        # 文档与截图（docs/images/ 供 README 引用）
 ├── Makefile                     # 构建、测试、lint、生成等目标
+├── LICENSE                      # AGPL-3.0 全文
 └── go.mod
 ```
 
@@ -164,17 +169,26 @@ liproxy/
 
 ### 前端
 
-| 类别 | 选型 |
-| --- | --- |
-| 框架 | React 18 + TypeScript |
-| 构建 | Vite |
-| UI | shadcn/ui + Tailwind CSS |
-| 数据获取 | TanStack Query |
-| 客户端状态 | Zustand |
-| 图表 | Recharts |
-| PWA | Workbox |
+| 类别 | 选型 | 说明 |
+| --- | --- | --- |
+| 框架 | Vue 3（Composition API + `<script setup>`） | 禁用 Options API 混写与 class 组件 |
+| 语言 | TypeScript（`strict: true`） | 禁止 `any` |
+| 构建 | Vite（`base: "./"`，`build.outDir: "dist"`） | 相对 base 是 embed 能工作的前提 |
+| UI | shadcn-vue + Tailwind CSS | 基础组件在 `components/ui/`，不手改 |
+| 数据获取 | TanStack Query for Vue（`@tanstack/vue-query`） | 服务端数据的唯一缓存层 |
+| 客户端状态 | Pinia | 只放跨页面客户端状态 |
+| 路由 | Vue Router（history 模式） | 依赖 Go 侧 SPA fallback |
+| 图表 | vue-echarts | 已定案，不再更换 |
+| PWA | `vite-plugin-pwa` | 关闭运行时外部资源下载 |
 
-**依赖准入规则：** 新增任何第三方依赖前必须确认三件事 ——（1）许可证为 MIT/Apache-2.0/BSD 等宽松协议；（2）不引入 CGO；（3）二进制体积增量可接受（普通依赖 < 500 KB，网络栈类需单独讨论）。任何违反的依赖必须在 PR 描述中说明理由。
+**前端硬性约束：**
+
+1. 组件命名 `PascalCase.vue`；页面级放 `web/src/pages/`，可复用组件放 `web/src/components/`
+2. 统一 `<script setup lang="ts">`，不写 `export default {}`
+3. **禁止 CDN 引用**；字体、图标、图表资源必须本地打包，不得运行时下载
+4. `web/dist/` 为生成物，不入库；gzip 后总体积 **< 2 MB**（见第 19 节体积红线）
+
+**依赖准入规则：** 新增任何第三方依赖前必须确认三件事 ——（1）许可证与 AGPL-3.0 兼容（宽松协议 MIT/Apache-2.0/BSD/ISC 可直接用，完整对照表见第 18 节；专有、SSPL、BSL、无许可证的一律禁止）；（2）不引入 CGO；（3）二进制体积增量可接受（普通依赖 < 500 KB，网络栈类需单独讨论）。任何违反的依赖必须在 PR 描述中说明理由。
 
 ---
 
@@ -287,19 +301,20 @@ Reality 是一种无需自建域名与证书的 TLS 伪装方案：
 - 共享状态用 channel 或 `sync.Mutex` 保护，禁止裸 map 并发读写
 - 热重载期间旧实例的关闭必须优雅：先停止接受新连接，再等待存量连接（有超时上限）
 
-### 前端
+### 前端（Vue 3）
 
 **组件**
 
-- 函数组件 + Hooks，禁止 class 组件
-- 一个文件一个主组件，文件名 `PascalCase.tsx`
+- 一律单文件组件（SFC）+ Composition API，统一 `<script setup lang="ts">`；禁止 Options API 混写、禁止 class 组件
+- 一个文件一个主组件，文件名 `PascalCase.vue`
 - 页面级组件放 `src/pages/`，可复用组件放 `src/components/`
-- shadcn/ui 组件放在 `src/components/ui/`，**不要手改**，需要定制时在业务层包装
+- shadcn-vue 组件放在 `src/components/ui/`，**不要手改**，需要定制时在业务层包装
+- 可复用的有状态逻辑放 `src/composables/useXxx.ts`，命名以 `use` 开头
 
 **状态**
 
-- 服务端数据一律用 TanStack Query，禁止用 Zustand 缓存接口数据
-- Zustand 只放跨页面的客户端状态（主题、侧边栏折叠、当前选中节点）
+- 服务端数据一律用 TanStack Query（`@tanstack/vue-query`），**禁止用 Pinia 缓存接口数据**
+- Pinia 只放跨页面的客户端状态（主题、侧边栏折叠、当前选中节点）
 - Query key 统一从 `src/api/keys.ts` 取，禁止在组件里手写字符串数组
 
 **样式**
@@ -330,7 +345,7 @@ Reality 是一种无需自建域名与证书的 TLS 伪装方案：
 **初始化**
 
 ```bash
-git clone https://github.com/liproxy/liproxy.git
+git clone https://github.com/LiStudioorg/liproxy.git
 cd liproxy
 
 # 后端依赖
@@ -338,6 +353,7 @@ go mod download
 
 # 前端依赖
 cd web && pnpm install && cd ..
+# 前端源码约定：pages/ · components/(ui/ 放 shadcn-vue) · api/ · stores/(Pinia) · composables/
 
 # 安装开发工具（golangci-lint、air、mockgen 等）
 make tools
@@ -383,9 +399,9 @@ make build
 # 等价于
 cd web && pnpm install --frozen-lockfile && pnpm build && cd ..
 go build -trimpath -ldflags "-s -w \
-  -X github.com/liproxy/liproxy/pkg/version.Version=$(git describe --tags --always) \
-  -X github.com/liproxy/liproxy/pkg/version.Commit=$(git rev-parse --short HEAD) \
-  -X github.com/liproxy/liproxy/pkg/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -X github.com/LiStudioorg/liproxy/pkg/version.Version=$(git describe --tags --always) \
+  -X github.com/LiStudioorg/liproxy/pkg/version.Commit=$(git rev-parse --short HEAD) \
+  -X github.com/LiStudioorg/liproxy/pkg/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   -o bin/lipd ./cmd/lipd
 ```
 
@@ -453,7 +469,7 @@ func init() {
 
 **第 5 步：在聚合处 blank import**
 
-在 `internal/registry/all/all.go`（聚合注册入口）中添加 `_ "github.com/liproxy/liproxy/internal/inbound/foo"`。
+在 `internal/registry/all/all.go`（聚合注册入口）中添加 `_ "github.com/LiStudioorg/liproxy/internal/inbound/foo"`。
 **不要**在 `engine`、`relay`、`router` 中 import 该包。
 
 **第 6 步：数据库侧**
@@ -815,8 +831,14 @@ handler 只做参数解析、调用 service、错误映射。业务逻辑写在�
 **15. 不要绕过 `lipd --check` 直接线上试配置。**
 改名、改端口、改规则前先 `lipd --check` 校验，再 `lip restart`。少一次事故。
 
-**16. 不要在前端用 Zustand 缓存接口数据。**
-TanStack Query 负责缓存与失效。两套缓存并存必然出现"数据不一致"类 bug。
+**16. 不要在前端用 Pinia 缓存接口数据。**
+TanStack Query 负责缓存与失效。两套缓存并存必然出现"数据不一致"类 bug。Pinia 只放纯客户端的 UI 状态。
+
+**17. 不要在前端引入任何外部 CDN 资源。**
+字体、图标、图表底图必须本地打包并随二进制嵌入。运行时从外网拉取资源会导致离线环境白屏，也让"单二进制零外部依赖"这条承诺失效。
+
+**18. 不要在 `/api/` 路径上做 SPA fallback。**
+`/api/v1/*` 路由必须注册在静态资源与 fallback 之前，未命中的 API 路径要返回 JSON 错误体而不是 `index.html`。否则前端会把 HTML 当成 JSON 解析，报出难以定位的错。详见第 19 节。
 
 ---
 
@@ -872,4 +894,331 @@ TanStack Query 负责缓存与失效。两套缓存并存必然出现"数据不�
 5. 在第 15 节的 PR 模板中填写变更说明
 ```
 
-<!-- TODO: 确认 -->
+## 18. License 规范
+
+**LiProxy 采用 [GNU Affero General Public License v3.0](../LICENSE)（AGPL-3.0）。**
+
+AGPL-3.0 是强 copyleft 协议：任何人修改并通过网络提供服务，都必须向使用者提供完整源代码（第 13 条）。这直接约束了我们的开发方式 —— 引入任何新依赖前，必须先确认它的许可证与 AGPL-3.0 兼容。
+
+**依赖许可证准入**
+
+| 许可证类型 | 是否可用 | 说明 |
+| --- | --- | --- |
+| MIT / Apache-2.0 / BSD-2 / BSD-3 / ISC | ✅ | 宽松协议，与 AGPL-3.0 兼容 |
+| MPL-2.0 / LGPL-2.1 / LGPL-3.0 | ⚠️ | 可用，但需在 PR 中说明动态链接方式与合规理由 |
+| GPL-2.0 / GPL-3.0 | ✅ | 与 AGPL-3.0 兼容 |
+| AGPL-3.0 | ✅ | 同协议 |
+| 专有 / 商业 / SSPL / BSL / Commons Clause | ❌ | **禁止引入**，会与 AGPL-3.0 冲突 |
+| 许可证缺失（无 LICENSE 文件） | ❌ | 默认保留全部权利，禁止引入 |
+
+新依赖必须在 PR 描述中列出名称、版本、许可证，并附上 `go-licenses` / `pnpm licenses list` 的核对结果。
+
+**每个源代码文件头部必须带 license header。** 没有例外：新文件、生成的代码模板、示例脚本都要带。CI 会校验（见下文）。
+
+### Go 文件 header
+
+```go
+// LiProxy - a web-driven universal proxy platform.
+// Copyright (C) 2026 LiProxy Contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package foo
+```
+
+> 注意：header 必须放在 `//go:build` 约束**之后**、`package` 声明**之前**。文件顶部的 `//go:generate` 指令可以留在 header 前面。
+
+### TypeScript / Vue 文件 header
+
+```ts
+/**
+ * LiProxy - a web-driven universal proxy platform.
+ * Copyright (C) 2026 LiProxy Contributors
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+```
+
+`.vue` 文件把这段注释放在文件**第一行**（`<script setup>` 块之外），这样构建产物里也能看到版权声明。
+
+### SQL 文件 header（含迁移）
+
+```sql
+-- LiProxy - a web-driven universal proxy platform.
+-- Copyright (C) 2026 LiProxy Contributors
+--
+-- This program is free software: you can redistribute it and/or modify
+-- it under the terms of the GNU Affero General Public License as published by
+-- the Free Software Foundation, either version 3 of the License, or
+-- (at your option) any later version.
+--
+-- This program is distributed in the hope that it will be useful,
+-- but WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-- GNU Affero General Public License for more details.
+--
+-- You should have received a copy of the GNU Affero General Public License
+-- along with this program.  If not, see <https://www.gnu.org/licenses/>.
+```
+
+> 迁移文件的 header 属于**已发布内容的一部分**：一旦迁移合入 `main`，header 就不可再修改（见第 11 节与第 16 节陷阱 6）。
+
+### Shell 脚本 header
+
+```sh
+#!/usr/bin/env bash
+# LiProxy - a web-driven universal proxy platform.
+# Copyright (C) 2026 LiProxy Contributors
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+set -euo pipefail
+```
+
+### 其他文件类型
+
+| 类型 | header 形式 |
+| --- | --- |
+| YAML / TOML | `#` 注释，同 Shell 格式 |
+| Makefile | `#` 注释，紧随 `.DEFAULT_GOAL` 之前 |
+| Markdown 文档 | 不需要 header；许可证信息集中在 README 的 License 章节 |
+| 生成物（`web/dist/`、`bin/`） | 不需要 header |
+
+### CI 检查
+
+CI 在 lint 阶段运行 header 校验，缺失即阻断合并：
+
+```bash
+# Go 文件（在 golangci-lint 之外单独校验，因为它按行匹配而不是按 AST）
+find . -name '*.go' -not -path './web/dist/*' -not -path './vendor/*' \
+  | xargs grep -L 'GNU Affero General Public License as published by' \
+  | tee /dev/stderr | (! read)
+
+# 前端与脚本
+pnpm exec license-header-check --template scripts/license-header.txt 'web/src/**/*.{ts,vue}'
+```
+
+**检查清单（每个 PR）：**
+
+- [ ] 新增的每个源文件都带 AGPL-3.0 header
+- [ ] 没有引入专有 / SSPL / BSL / 无许可证的依赖
+- [ ] 新增依赖已在 PR 描述中列出许可证并说明合规性
+- [ ] `LICENSE` 文件未被修改（AGPL-3.0 全文必须逐字保留）
+
+---
+
+## 19. 单二进制 embed 规范
+
+**产品承诺：用户拿到 `lipd` 一个文件就能跑，不需要额外部署前端静态文件。** 这一节是所有前端与 HTTP 路由相关改动必须遵守的契约。
+
+### 19.1 embed 的唯一归属
+
+`//go:embed` 只能出现在**一个**包里：`web/embed.go`。
+
+```go
+// web/embed.go（示意）
+package web
+
+//go:embed all:dist
+var webFS embed.FS
+```
+
+规则：
+
+1. 全仓库**只有 `web/embed.go` 允许出现 `//go:embed`**，其它包一律通过 `web.FS()` 或 `web.Handler()` 获取，禁止各自 embed
+2. 必须用 `all:` 前缀 —— 否则 `_` 与 `.` 开头的文件（Vite 产物里常见）会被静默忽略
+3. `web` 包对外只暴露三个符号：`FS() fs.FS`、`Handler() http.Handler`、`Available() bool`；内部结构体（如 `distFS`）不导出
+4. `web/dist/` 是**生成物**，写进 `.gitignore`，不入库；仓库里只保留 `web/dist/.gitkeep`
+5. **`web/dist/.gitkeep` 必须存在**：`go:embed all:dist` 在目录不存在时是编译期错误，会让 `go build ./...`、`go vet`、CI 的纯后端任务全部失败。占位目录保证"只改后端的人也能编译"
+6. **禁止**在 `CMD`/`Dockerfile`/`Makefile` 里把 dist 复制到二进制旁边作为 fallback —— 单文件承诺不允许有"运行时找文件"的分支
+
+> 开发环境（`LIPROXY_DEV=1` 或 `make dev`）下不经过 embed：Vite dev server 提供前端（5173），Go 只提供 API（9090），由 Vite 的 `server.proxy` 转发 `/api`。两条路互不干扰，生产构建永远走 embed。
+
+### 19.2 路由注册顺序（硬约束）
+
+chi 的中间件与路由按注册顺序生效，顺序错了会出现"API 返回 HTML""WebSocket 被 fallback 吃掉"这类难查的 bug。
+
+```text
+1. 全局中间件         → Recoverer · RequestID · 日志 · CORS
+2. /api/v1/ws         → WebSocket 升级（最先，不被任何 body 改写中间件包裹）
+3. /api/v1/*          → REST API（含认证、限流、统一错误映射）
+4. /healthz /metrics  → 探针，不需要认证
+5. /*                 → 静态资源 + SPA fallback（最后，兜底一切）
+```
+
+**必须在代码里有测试固化这个顺序**（见 19.5）。
+
+### 19.3 SPA fallback 规则
+
+静态资源处理器按以下顺序决策：
+
+| 请求 | 行为 |
+| --- | --- |
+| 命中 `dist/` 下的**文件** | `http.ServeContent` 原样返回（保留 ETag / Last-Modified / 304） |
+| 命中 `dist/` 下的**目录** | 找该目录的 `index.html`；没有再回落根 `index.html` |
+| 未命中，路径以 `/api/` 开头 | **返回 JSON 404**（`{"error":{"code":"not_found"}}`），**绝不返回 HTML** |
+| 未命中，其他路径 | 返回根 `index.html` + 200，交给 Vue Router（history 模式）接管 |
+| 方法非 GET / HEAD | 返回 405，不做 fallback |
+| 路径包含 `..` 或未清理的转义 | 返回 400，防止目录穿越 |
+
+**缓存策略**（写死，不做配置）：
+
+| 路径 | Cache-Control | 理由 |
+| --- | --- | --- |
+| `/assets/*` | `public, max-age=31536000, immutable` | Vite 文件名带内容 hash，内容变了文件名就变 |
+| `/index.html` | `no-cache` | 否则用户永远拿不到新版本 |
+| `/sw.js`、`/manifest.webmanifest` | `no-cache` | Service Worker 更新必须立即可见 |
+| 其它根级文件（favicon 等） | `public, max-age=3600` | 折中值 |
+
+**预压缩**：构建期同时产出 `.gz`（必要时 `.br`），命中 `Accept-Encoding` 时直接吐预压缩文件 —— 运行时 gzip 会同时吃掉 CPU 和内存预算，与内存目标冲突。
+
+**安全**：静态资源处理器必须在 `path.Clean` 之后做前缀校验，且**只读** embed FS，不允许任何写路径。API 404 的错误体由统一错误中间件生成，不在 fallback 里手写状态码（见第 16 节陷阱 14）。
+
+### 19.4 Makefile 契约
+
+`make build` 必须串起前端构建与 Go 构建，顺序不可颠倒：
+
+```make
+build: build-frontend
+	go build -trimpath -ldflags "..." -o bin/lipd ./cmd/lipd
+	go build -trimpath -ldflags "..." -o bin/lip  ./cmd/lip
+
+build-frontend:
+	cd web && pnpm install --frozen-lockfile && pnpm build
+```
+
+- `build` 依赖 `build-frontend`，不能并行（Go 侧要读到产出的 dist）
+- `build-frontend` 独立可调用，方便只改前端时复用
+- `clean` 必须清理 `bin/` 与 `web/dist/`（但保留 `web/dist/.gitkeep`）
+- `make build` 完成后**必须**打印 `bin/lipd` 的体积，让体积回归立刻可见
+
+### 19.5 体积红线与验收
+
+| 指标 | 红线 | 检查方式 |
+| --- | --- | --- |
+| `web/dist/` gzip 后总量 | **< 2 MB** | `tar czf - -C web/dist . \| wc -c` |
+| 全协议 `bin/lipd` | ≈ 25 MB | `ls -lh bin/lipd` |
+| 精简版 `bin/lipd` | ≈ 8 MB | `make build-minimal && ls -lh bin/lipd` |
+| 空闲内存 | < 15 MB | `./bin/lipd` 后读 RSS |
+
+超过红线的 PR 必须在描述中给出理由与瘦身计划。
+
+**每次改动 embed / 路由 / 前端构建配置后，必须完成"干净目录冒烟测试"：**
+
+```bash
+make build
+rm -rf /tmp/lip-smoke && mkdir -p /tmp/lip-smoke
+cp bin/lipd /tmp/lip-smoke/ && cd /tmp/lip-smoke && ./lipd
+# 浏览器打开 http://127.0.0.1:9090，必须看到 Vue Web 界面（不是目录列表、不是 404）
+```
+
+外加三条自动化断言（必须有测试固化，不能只靠人工点）：
+
+1. `GET /` 返回 200 且 `Content-Type: text/html`，body 包含 `<div id="app">`
+2. `GET /api/v1/nonexistent` 返回 404 且 `Content-Type: application/json`，**body 不是 HTML**
+3. `GET /nodes`（任意前端深链）返回 200 且是 `index.html`，而 `GET /assets/<真实文件名>` 返回 200 且带 `immutable` 缓存头
+
+---
+
+## 20. 路线图（Roadmap）
+
+Phase 只定义**边界与出口标准**，不规定实现细节。每个 Phase 内部再拆成最小可交付单元，串行推进，每单元一次 review。
+
+### Phase 1 — 可用骨架（Skeleton）
+
+**目标**：`make build` 产出的 `bin/lipd` 拷到干净目录能独立启动，浏览器打开能看到 Vue 界面并完成一次登录。
+
+| 出口标准 | 验证方式 |
+| --- | --- |
+| 单二进制可独立运行 | 19.5 的干净目录冒烟测试 |
+| `liproxy.toml` 10 字段可解析，非法组合拒绝启动 | bootstrap 表驱动测试 |
+| 数据库自动迁移，失败拒绝启动 | 迁移测试三件套 |
+| 管理员账号首次启动生成随机密码，只打印一次 | auth 测试 + 日志断言无密码原文 |
+| Web 登录 → 概览页可访问 | 端到端冒烟 |
+| `/api/v1/*` 返回 JSON，前端深链返回 index.html | 19.5 的三条断言 |
+
+**不含**：任何真实代理协议、规则引擎、Provider 拉取、DNS、流量统计。
+
+### Phase 2 — 配置内核（Config Core）
+
+**目标**：IR 成为唯一配置表示，版本管理闭环。
+
+| 出口标准 | 验证方式 |
+| --- | --- |
+| `config.Compile` 纯函数，DB 快照 → IR | 单测 + 相同输入相同输出断言 |
+| 写操作同事务生成 version，失败全回滚 | 并发写测试（version 不串号） |
+| diff / rollback / export 可用 | round-trip 测试：import → IR → export → import |
+| 版本历史可在 Web 查看与回滚 | 端到端 |
+
+**不含**：引擎热重载（Phase 3）、真实协议。
+
+### Phase 3 — 引擎与首个协议（Engine + First Protocol）
+
+**目标**：IR 能驱动真实转发，热重载不泄漏。
+
+| 出口标准 | 验证方式 |
+| --- | --- |
+| registry 自注册生效，核心引擎零协议 import | `go list -deps` 断言 |
+| 至少一个协议完成回环测试（1 MB 随机数据） | 回环测试 |
+| 热重载：旧连接优雅关闭，goroutine 不泄漏 | 连续热重载 + goroutine 计数断言 |
+| relay 转发有 benchmark 基线 | `make bench` 报告入 PR |
+
+**风险**：这一 Phase 触及 `relay` / `router` / `bufpool`，属于"必须人工 review"范围。
+
+### Phase 4 — 协议与传输铺开（Protocol Breadth）
+
+**目标**：协议覆盖面对齐 Mihomo 客户端能力。
+
+按 AGENTS.md 第 9 节的九步流程逐个协议推进，每个协议一个 PR。**每个协议的体积增量都要单独测量并记录。**
+
+**不含**：服务端多用户、订阅分发（Phase 5）。
+
+### Phase 5 — 服务端与分发（Server Mode）
+
+**目标**：多用户、流量配额、ACME、订阅生成，对齐 sing-box 服务端能力。
+
+| 出口标准 | 验证方式 |
+| --- | --- |
+| 多用户独立凭据与配额，超额自动停用 | 配额边界测试 |
+| 流量计量异步批量写回，不影响转发路径 | 转发路径 benchmark 无分配回归 |
+| 订阅生成三种格式（clash / v2ray / sing-box） | 格式快照测试 |
+| ACME 自动申请与续期 | 使用测试目录（禁止真实外网） |
+
+### 贯穿所有 Phase 的常驻要求
+
+- 每个 Phase 结束时更新 README 与 AGENTS.md，文档与代码不允许漂移
+- 内存指标在 Phase 3 之后每个 PR 都要有数据，不允许"先涨上去以后再优化"
+- 任何新增依赖都走第 18 节的许可证准入
+

@@ -5,8 +5,8 @@
 LiProxy 把 Mihomo 级别的客户端能力和 sing-box 级别的服务端能力装进同一个 Go 二进制里，并且用 Web 界面替代了手写 YAML。你不再需要编辑几千行配置文件：配置存在数据库里，Web 就是唯一主入口。
 
 [![Go Version](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Build](https://github.com/liproxy/liproxy/actions/workflows/build.yml/badge.svg)](https://github.com/liproxy/liproxy/actions/workflows/build.yml)
+[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+[![Build](https://github.com/LiStudioorg/liproxy/actions/workflows/build.yml/badge.svg)](https://github.com/LiStudioorg/liproxy/actions/workflows/build.yml)
 
 ---
 
@@ -85,7 +85,7 @@ Web 界面默认监听 `http://127.0.0.1:9090`，浏览器打开即可。
 
 ```bash
 # 需要 Go 1.22+ 与 Node.js 20+ / pnpm 9+
-git clone https://github.com/liproxy/liproxy.git
+git clone https://github.com/LiStudioorg/liproxy.git
 cd liproxy
 
 # 构建前端与后端（前端产物会嵌入二进制）
@@ -434,7 +434,7 @@ tar czf liproxy-backup.tar.gz -C ~/.li liproxy
 快速上手：
 
 ```bash
-git clone https://github.com/liproxy/liproxy.git
+git clone https://github.com/LiStudioorg/liproxy.git
 cd liproxy
 make dev      # 同时启动后端热重载与前端 Vite dev server
 make test     # 运行全部测试
@@ -448,4 +448,23 @@ make lint     # golangci-lint + eslint
 
 ## License
 
-[MIT](LICENSE) © LiProxy Contributors
+[AGPL-3.0](LICENSE) © LiProxy Contributors
+
+LiProxy 采用 **GNU Affero General Public License v3.0**。你可以自由使用、修改和分发，但**通过网络提供服务时必须向用户提供完整源代码**（AGPL-3.0 第 13 条）。
+
+```
+Copyright (C) 2026 LiProxy Contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+```
