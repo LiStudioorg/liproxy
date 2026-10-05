@@ -122,7 +122,8 @@ lipd
 ```text
 2026-01-01T12:00:00+08:00 INF LiProxy v0.1.0 (commit 0a1b2c3, go1.22.5)
 2026-01-01T12:00:00+08:00 INF data directory ready path=/home/you/.li/liproxy
-2026-01-01T12:00:00+08:00 INF database initialized path=/home/you/.li/liproxy/liproxy.db version=1
+2026-01-01T12:00:00+08:00 INF config loaded files=1 sources=[liproxy.toml]
+2026-01-01T12:00:00+08:00 INF database initialized path=/home/you/.li/liproxy/state/li.db version=1
 2026-01-01T12:00:00+08:00 WRN ┌────────────────────────────────────────────────┐
 2026-01-01T12:00:00+08:00 WRN │  Initial admin credentials (shown once only)   │
 2026-01-01T12:00:00+08:00 WRN │  Username: admin                               │
@@ -134,12 +135,15 @@ lipd
 
 > 该密码只在首次启动时打印一次。请立即登录并修改。
 
+**日志在哪？** 上面这些就是全部日志 —— LiProxy 只写 stdout，不落盘。前台运行时直接看终端；作为系统服务运行时用 `journalctl -u liproxy -f`；Docker 下用 `docker logs -f liproxy`。需要长期保留就在部署层配置采集，而不是在 LiProxy 里配。
+
 **下一步：**
 
 1. 浏览器打开 `http://127.0.0.1:9090`
 2. 用 `admin` 和上面的随机密码登录
 3. 进入 **设置 → 账户** 修改密码
-4. 进入 **节点** 添加你的第一个代理节点，回到 **概览** 启动引擎
+4. 把节点写进 `~/.li/liproxy/liproxy.toml`（或拆到 `toml.d/nodes.toml`），保存即热重载
+5. 回到 **概览** 确认节点已加载，必要时用 **运行时** 页切换当前节点
 
 **忘记密码怎么办？**
 
@@ -165,9 +169,10 @@ LiProxy 的配置**就是文件**，没有第二份藏在数据库里。
 │   ├── li.db             #   会话 · API Key · 审计 · 流量 · 订阅缓存
 │   ├── overrides.toml    #   Web 写入的运行时覆盖
 │   └── fakeip.db         #   Fake-IP 映射
-├── backups/              # 自动备份
-└── logs/                 # 运行日志，按天轮转
+└── backups/              # 自动备份
 ```
+
+日志只写到 **stdout**，不落盘 —— 收集交给 systemd journal / Docker logging driver。
 
 `toml.d/` `yaml.d/` 让你把配置拆成小块：一个文件放节点，一个放规则，一个放 DNS。改哪块改哪个文件，不用在几千行里翻找。
 
@@ -255,9 +260,10 @@ enabled = true         # 纯客户端模式可设为 false，不创建数据库
 path    = "~/.li/liproxy/state/li.db"
 
 [log]
-level = "info"
-file  = "~/.li/liproxy/logs/liproxy.log"
+level = "info"          # debug / info / warn / error
 ```
+
+日志输出到 stdout，由部署层（systemd / Docker / 日志采集器）负责收集与保留。
 
 节点、规则、DNS、入站出站等业务配置同样写在这个文件（或 `toml.d/` `yaml.d/` 片段）里，字段说明见 `docs/`。
 
@@ -461,8 +467,7 @@ lip import clash config.yaml --dry-run
 ├── toml.d/          # TOML 配置片段
 ├── yaml.d/          # YAML 配置片段
 ├── state/           # 运行时状态：数据库、overrides、Fake-IP
-├── backups/         # 自动备份
-└── logs/            # 运行日志，按天轮转，默认保留 7 天
+└── backups/         # 自动备份
 ```
 
 | 路径 | 是否可手改 | 说明 |
@@ -472,7 +477,8 @@ lip import clash config.yaml --dry-run
 | `state/` | ⚠️ | 运行时状态，删掉会重建（历史流量与审计随之丢失） |
 | `state/overrides.toml` | ⚠️ | 由 Web 生成，手改会被覆盖。业务配置请改上面的文件 |
 | `backups/` | ❌ | 自动生成 |
-| `logs/` | ✅ | 可随时删除，会自动重建 |
+
+日志不落盘：LiProxy 只写 stdout，用 `journalctl -u liproxy -f` 或 `docker logs -f liproxy` 查看。
 
 **一句话区分**：`liproxy.toml` 与 `*.d/` 没了，你就丢了配置；`state/` 没了，只是丢了历史。
 
@@ -549,7 +555,7 @@ cp -r ~/.li/liproxy/liproxy.toml ~/.li/liproxy/toml.d ~/.li/liproxy/yaml.d /path
 ```bash
 lip config check      # 语法或校验错误会直接指出来
 lip config sources    # 看这个字段最终是谁提供的 —— 很可能被更高优先级的文件覆盖了
-tail -f ~/.li/liproxy/logs/liproxy.log   # 看热重载日志
+journalctl -u liproxy -f                 # 看热重载日志（裸跑时直接看终端）
 ```
 
 最常见的原因是优先级：`yaml.d/` 覆盖 `toml.d/`，而 `toml.d/` 覆盖主配置。第二种常见原因是配置有错，LiProxy 保留了上一份可用配置继续运行 —— 这时 Web 顶部会有降级告警。

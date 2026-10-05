@@ -155,7 +155,7 @@ liproxy/
 ├── pkg/
 │   ├── bufpool/                 # 分级 buffer pool
 │   ├── strpool/                 # 字符串驻留
-│   ├── log/                     # zerolog 封装与脱敏
+│   ├── log/                     # zerolog 封装与脱敏（只输出到 stdout）
 │   └── version/                 # 版本号、commit、构建时间（ldflags 注入）
 ├── docs/                        # 文档与截图（docs/images/ 供 README 引用）
 ├── Makefile                     # 构建、测试、lint、生成等目标
@@ -175,11 +175,12 @@ liproxy/
 │   ├── li.db             #   SQLite：会话 · API Key · 审计 · 流量 · 订阅缓存
 │   ├── overrides.toml    #   Web 写入的运行时覆盖（仅白名单字段）
 │   └── fakeip.db         #   Fake-IP 映射持久化
-├── backups/              # 自动备份（写 overrides 前先备份）
-└── logs/                 # 运行日志，按天轮转
+└── backups/              # 自动备份（写 overrides 前先备份）
 ```
 
-> `state/` 与 `backups/` `logs/` 里的一切都**不是权威源**：删掉它们，服务能重建；删掉主配置与 `*.d/`，服务就失去了业务配置。这条区分是排查问题的第一把尺子。
+> `state/` 与 `backups/` 里的一切都**不是权威源**：删掉它们，服务能重建；删掉主配置与 `*.d/`，服务就失去了业务配置。这条区分是排查问题的第一把尺子。
+
+**没有日志目录。** LiProxy 只把结构化日志写到 stdout，不落盘、不做轮转 —— 收集与保留交给 systemd journal、Docker logging driver 或你选择的日志系统（见第 4 节与第 8 节）。
 
 **包依赖方向（硬约束）：**
 
@@ -203,7 +204,7 @@ cmd/lipd ──▶ config ──▶ (IR) ──▶ engine ──▶ registry
 | --- | --- | --- |
 | 语言 | Go 1.22+ | 使用 `log/slog` 之外自选的 zerolog，泛型、`min`/`max` 内建可用 |
 | HTTP 路由 | `github.com/go-chi/chi/v5` | 轻量、标准 `net/http` 兼容 |
-| 日志 | `github.com/rs/zerolog` | 零分配 JSON 日志，统一入口 `pkg/log` |
+| 日志 | `github.com/rs/zerolog` | 零分配 JSON 日志，统一入口 `pkg/log`；**只输出 stdout，不写文件、不做轮转** |
 | QUIC | `github.com/quic-go/quic-go` | Hysteria2 / TUIC / DoQ / QUIC 传输 |
 | 用户态网络栈 | `gvisor.dev/gvisor/pkg/tcpip` | TUN gVisor 模式 |
 | 数据库 | `modernc.org/sqlite` | 纯 Go，无 CGO；**仅存运行时状态，可选启用** |
@@ -355,6 +356,7 @@ Reality 是一种无需自建域名与证书的 TLS 伪装方案：
 **日志**
 
 - 统一使用 `pkg/log` 暴露的 logger，禁止直接 `fmt.Println` 或自建 `zerolog.Logger`
+- **只写 stdout**：禁止在代码里打开日志文件、建目录、做轮转。日志收集是部署层的事，交给 systemd journal / Docker logging driver / 日志采集器
 - 结构化字段优先：`log.Info().Str("protocol", "vless").Int("port", 443).Msg("inbound started")`
 - 热路径（每连接、每包）日志必须为 `Debug` 级别，且使用 `log.Debug()` 的惰性求值形式
 - **禁止**在日志中输出：密码、私钥、UUID、JWT、API Key、订阅原文（见第 14 节）
@@ -410,7 +412,7 @@ Reality 是一种无需自建域名与证书的 TLS 伪装方案：
 | Node.js | ≥ 20 | 前端构建 |
 | pnpm | ≥ 9 | 前端包管理，不使用 npm/yarn |
 | Make | 任意 | 统一入口，所有命令都从 Makefile 走 |
-| SQLite CLI | ≥ 3.40 | 仅调试用，`sqlite3 liproxy.db` |
+| SQLite CLI | ≥ 3.40 | 仅调试用，`sqlite3 state/li.db`（数据库可选，纯客户端模式不创建） |
 
 **初始化**
 
@@ -790,7 +792,7 @@ go build -gcflags="-m" ./internal/relay/    # 检查逃逸分析
 - `pkg/log` 提供 `log.Redact(s string) string`，输出敏感串时使用它
 - 结构体整体打印时必须实现 `LogValue()` 或显式构造安全字段列表
 - 排查问题时优先输出**指纹**（如 `sha256` 前 8 位）而不是原文
-- 错误响应给客户端时只返回通用消息 + 错误码，详细原因只进服务端日志
+- 错误响应给客户端时只返回通用消息 + 错误码，详细原因只进服务端 stdout（由部署层收集）
 
 **存储**
 
@@ -914,7 +916,7 @@ SQLite 的 `DROP COLUMN` 在旧版本上行为不一致，且会让旧版本程�
 每个 goroutine 都要能退出，否则热重载会泄漏 goroutine，长时间运行后内存只增不减。
 
 **11. 不要在日志中打印配置结构体。**
-`log.Info().Interface("node", node)` 会把 UUID 和密码写进日志文件。永远显式列出要输出的字段。
+`log.Info().Interface("node", node)` 会把 UUID 和密码写进 stdout，进而被 journal / Docker 日志系统长期留存。永远显式列出要输出的字段。
 
 **12. 不要忽略 `bufpool.Put`。**
 缓冲池的收益完全依赖归还。忘记归还比不用池更糟（每次分配新缓冲）。用 `defer` 保证归还。
@@ -1349,7 +1351,7 @@ Phase 只定义**边界与出口标准**，不规定实现细节。每个 Phase 
 优先级从低到高（后者覆盖前者）
 
 1. 内置默认值（编译进二进制，保证空配置也能启动）
-2. 主配置：liproxy.toml，若不存在则用 liproxy.yaml（二选一，不共存）
+2. 主配置：liproxy.toml
 3. toml.d/*.toml   按文件名字典序（byte-wise，等价于 sort）
 4. yaml.d/*.yaml   按文件名字典序
 5. state/overrides.toml   仅运行时白名单字段（见 21.6）
@@ -1357,7 +1359,7 @@ Phase 只定义**边界与出口标准**，不规定实现细节。每个 Phase 
 
 两条硬规则：
 
-- **主配置二选一**：`liproxy.toml` 存在时**完全忽略** `liproxy.yaml`。两个都在时在日志里给一条 `warn`，指明被忽略的那个路径。不做"两个都加载再合并"——那会让"我改了 yaml 为什么没生效"变成一个无解的问题。
+- **主配置只有 TOML 一种**：`liproxy.toml` 是唯一的主配置入口。YAML 只用于 `yaml.d/` 片段 —— 这样"主配置在哪里"永远只有一个答案，不需要处理"两个主配置并存时听谁的"。
 - **字典序是 byte-wise 排序**，不是本地化排序。这样 `10-a.toml` 排在 `9-a.toml` 前面，行为在所有机器上一致。想控制顺序就**用零填充前缀**（`001-`、`002-`），并在文档里明确写出这个约定。
 
 ### 21.2 include
@@ -1378,7 +1380,7 @@ exclude = ["providers/**/disabled-*.yaml"]
 
 # 结构化 include：需要跨格式或可选时用这种写法
 [[include]]
-path     = "remote/rules.yaml"
+path     = "extra/rules.yaml"
 format   = "yaml"                  # 显式指定格式，覆盖扩展名推断
 optional = true                    # 不存在则跳过，不报错
 ```
@@ -1390,7 +1392,7 @@ optional = true                    # 不存在则跳过，不报错
 2. 扩展名 `.toml` / `.yaml` / `.yml`
 3. 都判定不出来 → 报错，不猜
 
-**远程 include（默认关闭）**：必须同时显式开启 `allow_remote = true` 且给出 `sha256` 或 `cache_ttl`，否则拒绝加载。远程内容缓存在 `state/` 下，本地副本是编译输入 —— 这样 `Compile` 依然是纯函数，也不会因为网络抖动导致热重载失败。
+**include 只支持本地路径。** 远程 URL 不在范围内：既没有实现计划，也不在文档里承诺。配置必须能在没有网络的环境下完整加载。
 
 ### 21.3 三道防线（必须有测试）
 
@@ -1473,7 +1475,7 @@ config: invalid value for "inbounds[0].listen": port 0 is not allowed
 配置加载是本项目测试最密集的地方，必须覆盖：
 
 - **优先级**：同样字段在 5 个层级各写一次，断言胜出者与 `lip config sources` 输出一致
-- **主配置二选一**：两个主配置同时存在时，被忽略的是 YAML，且有 warn 日志
+- **主配置唯一**：`liproxy.yaml` 不作为主配置被读取（它是普通片段目录里的格式，不是主配置入口）
 - **字典序**：`10-` 排在 `9-` 之前（固化 byte-wise 语义）
 - **include 环**：`a → b → a` 必须报错且错误信息含完整链
 - **符号链接环**：`a → link/b → a` 同样必须被检出（这是最容易漏的用例）
