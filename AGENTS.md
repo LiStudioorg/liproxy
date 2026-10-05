@@ -14,9 +14,10 @@ LiProxy 是一个用 Go 1.22+ 编写的、Web 驱动的全能代理平台。它�
 
 **关键定位（三句话）：**
 
-1. **Web 是唯一主入口** —— 所有业务配置（节点、规则、Provider、DNS、用户、流量、版本）都在数据库里，只能通过 Web 或 REST API 修改。
-2. **数据库是权威源（Source of Truth）** —— 冲突时以数据库为准，配置文件永远不描述业务。
-3. **配置文件仅承载引导参数** —— `liproxy.toml` 只有 10 个字段，回答"进程怎么启动"，不回答"运行什么"。
+1. **配置文件是权威源（Source of Truth）** —— 业务配置写在 `~/.li/liproxy/` 下的主配置与 `toml.d/` `yaml.d/` 片段里，冲突时以合并结果为准，数据库里没有第二份业务配置。
+2. **Web 是观察者与运行时调节器** —— Web 只读当前生效的 IR、连接、流量与日志，唯一的写能力是 `state/overrides.toml` 里的运行时字段（切节点、临时规则、日志级别）。Web 永远不写主配置与片段目录。
+3. **数据库降级为运行时状态** —— SQLite 只存会话、API Key、审计、流量日志、订阅缓存与运行时快照，且是**可选组件**：纯客户端模式不创建数据库也能跑。
+4. **IR 是唯一的内存表示** —— TOML 与 YAML 都只是前端解析器，解析后统一编译为 IR，核心引擎只认 IR，不认 TOML / YAML。
 
 **硬性目标：**
 
@@ -85,11 +86,23 @@ LiProxy 是一个用 Go 1.22+ 编写的、Web 驱动的全能代理平台。它�
                               └────────────────────────┘
 ```
 
-**数据流（一次配置变更）：**
+**数据流（一次文件配置变更 —— 主路径）：**
 
 ```text
-Web 表单 → API handler → 服务层校验 → 写入 db（新 version）
-        → config 编译为 IR → engine 热重载 → 旧连接优雅关闭 → 新配置生效
+用户编辑 主配置 / toml.d/ / yaml.d/
+   → 文件监听或 SIGHUP 触发
+   → config 扫描：include 展开 → 通配符展开 → 循环检测 → 按优先级合并
+   → 校验 + 编译为 IR（失败则保留上一份可用 IR，拒绝热重载并报错到日志）
+   → engine 热重载 → 旧连接优雅关闭 → 新配置生效
+```
+
+**数据流（一次运行时覆盖 —— Web 的唯一写路径）：**
+
+```text
+Web 表单 → API handler → 校验字段属于运行时白名单
+        → 写入 state/overrides.toml（原子替换：临时文件 + rename）
+        → 走同一套加载与编译流程 → 热重载
+        → 若校验失败：回滚 overrides.toml，保留旧 IR，向前端返回错误
 ```
 
 **数据流（一次连接）：**
@@ -107,12 +120,13 @@ inbound 接受连接 → transport 解包 → sniffer 嗅探域名
 ```text
 liproxy/
 ├── cmd/
-│   ├── lipd/                    # 守护进程入口：解析 flag、加载 bootstrap、启动 API 与 engine
+│   ├── lipd/                    # 守护进程入口：解析 flag、加载配置、启动 API 与 engine
 │   └── lip/                     # CLI 入口：子命令注册、与 lipd 通过本地 API 通信
 ├── internal/
-│   ├── db/                      # SQLite 连接、迁移、事务、仓储（唯一允许写 SQL 的地方）
-│   ├── bootstrap/               # 解析 liproxy.toml（10 个字段），产出 BootstrapConfig
-│   ├── config/                  # IR 定义、编译（DB → IR）、导入导出、版本 diff / 回滚
+│   ├── config/                  # 【权威源】文件加载 · include 展开 · 合并 · 校验 · 编译 IR
+│   │                            #   不 import db；db 反过来依赖它
+│   ├── db/                      # SQLite：运行时状态（会话 · API Key · 审计 · 流量 · 订阅缓存）
+│   │                            #   迁移 · 事务 · 仓储（唯一允许写 SQL 的地方）；可选启用
 │   ├── registry/                # 协议工厂注册表：按类型名创建 inbound/outbound
 │   ├── inbound/                 # 入站协议实现（http、socks、ss、vmess、vless、trojan…）
 │   ├── outbound/                # 出站协议实现（与 inbound 同源，独立目录组织拨号逻辑）
@@ -126,7 +140,7 @@ liproxy/
 │   ├── server/                  # 服务端模式：多用户、流量计量与配额、ACME、订阅生成
 │   ├── api/                     # REST + WebSocket：路由、handler、DTO、中间件
 │   ├── auth/                    # JWT、Refresh Token、API Key、密码哈希
-│   ├── engine/                  # 运行时引擎：加载 IR、构建实例、热重载、统计上报
+│   ├── engine/                  # 运行时引擎：接收 IR、构建实例、热重载、统计上报
 │   └── relay/                   # 转发核心：双向拷贝、splice 零拷贝、超时与统计
 ├── web/                         # 前端：Vue 3 + TS + Vite（构建产物 web/dist 嵌入二进制，见第 19 节）
 │   ├── embed.go                 # 唯一持有 //go:embed all:dist 的 Go 文件
@@ -149,6 +163,36 @@ liproxy/
 └── go.mod
 ```
 
+**用户侧配置目录**（不在仓库里，是运行时的权威源）：
+
+```text
+~/.li/liproxy/
+├── liproxy.toml          # 主配置（TOML，优先）
+├── liproxy.yaml          # 主配置（YAML，仅当 liproxy.toml 不存在时启用）
+├── toml.d/               # TOML 片段，按文件名字典序加载
+├── yaml.d/               # YAML 片段，按文件名字典序加载
+├── state/                # 运行时状态（非权威）
+│   ├── li.db             #   SQLite：会话 · API Key · 审计 · 流量 · 订阅缓存
+│   ├── overrides.toml    #   Web 写入的运行时覆盖（仅白名单字段）
+│   └── fakeip.db         #   Fake-IP 映射持久化
+├── backups/              # 自动备份（写 overrides 前先备份）
+└── logs/                 # 运行日志，按天轮转
+```
+
+> `state/` 与 `backups/` `logs/` 里的一切都**不是权威源**：删掉它们，服务能重建；删掉主配置与 `*.d/`，服务就失去了业务配置。这条区分是排查问题的第一把尺子。
+
+**包依赖方向（硬约束）：**
+
+```text
+cmd/lipd ──▶ config ──▶ (IR) ──▶ engine ──▶ registry
+                │                              ▲
+                └──▶ db（仅运行时状态）─────────┘ 协议实现经 registry 自注册
+```
+
+- `internal/config` **不 import `internal/db`**：配置来自文件系统，与数据库无关
+- `internal/db` 可以 import `internal/config`（例如把 IR 指纹写进运行时快照）
+- 反向依赖一旦出现，就说明有人想把数据库变回权威源 —— 这正是本次架构调整要根除的东西
+
 ---
 
 ## 4. 技术栈与依赖
@@ -162,9 +206,11 @@ liproxy/
 | 日志 | `github.com/rs/zerolog` | 零分配 JSON 日志，统一入口 `pkg/log` |
 | QUIC | `github.com/quic-go/quic-go` | Hysteria2 / TUIC / DoQ / QUIC 传输 |
 | 用户态网络栈 | `gvisor.dev/gvisor/pkg/tcpip` | TUN gVisor 模式 |
-| 数据库 | `modernc.org/sqlite` | 纯 Go，无 CGO，保证静态单二进制 |
-| TOML | `github.com/BurntSushi/toml` | 引导配置解析 |
-| YAML | `gopkg.in/yaml.v3` | Clash / sing-box 配置解析与导出 |
+| 数据库 | `modernc.org/sqlite` | 纯 Go，无 CGO；**仅存运行时状态，可选启用** |
+| TOML | `github.com/BurntSushi/toml` | 主配置与 `toml.d/` 解析 |
+| YAML | `gopkg.in/yaml.v3` | `yaml.d/` 解析 + Clash / sing-box 导入导出 |
+| 通配符 | 标准库 `path/filepath.Glob` + 自实现 `**` | 见第 21 节；不引入第三方 glob 库 |
+| 配置校验 | 自实现结构体校验（首选）或 CUE | 见第 21 节校验小节 |
 | 认证 | JWT + Refresh Token + API Key | 自实现，见 `internal/auth` |
 
 ### 前端
@@ -196,11 +242,25 @@ liproxy/
 
 ### IR（Intermediate Representation）
 
-IR 是 LiProxy 配置的唯一内存表示，定义在 `internal/config`。数据库中的每一张配置表（节点、规则、DNS、入站、出站、策略组…）都会被编译成 IR 中的一个结构体，引擎只认 IR，不认数据库行、不认 YAML。
+IR 是 LiProxy 配置的唯一内存表示，定义在 `internal/config`。TOML 与 YAML 文件里的每一个结构（节点、规则、DNS、入站、出站、策略组…）都会被编译成 IR 中的一个结构体，引擎只认 IR，不认 TOML、不认 YAML。
 
-- **唯一入口**：`config.Compile(dbSnapshot) (*IR, error)`
+- **唯一入口**：`config.Compile(files *FileSet) (*IR, error)`
+  - `FileSet` 是"已展开、已排序、已读取"的配置片段集合，由 `Load` 阶段产出
+  - `Compile` 不碰文件系统、不碰网络，纯粹把内存中的 `FileSet` 变成 IR
 - **不变量**：IR 必须是不可变的（编译完成后不再修改），热重载 = 编译出新 IR 并整体替换
 - **零反射**：IR 的序列化/反序列化走手写代码或代码生成，禁止在热路径上用 `encoding/json` + 反射处理 IR
+- **双格式同构**：TOML 与 YAML 解析到**同一个中间结构**后再合并，合并逻辑只写一份。不允许"TOML 走一条合并路径、YAML 走另一条"
+
+**两段式设计（重要）：**
+
+```text
+Load 阶段（有 IO）                    Compile 阶段（纯函数）
+扫描目录 → 展开 include/通配符          FileSet → 合并 → 校验 → IR
+→ 读文件 → 记录来源行号                 ｜
+→ 产出 FileSet（含 provenance）         └─ 相同 FileSet 必然产出相同 IR
+```
+
+把 IO 与合并彻底分开，是为了让合并与校验逻辑可以被完整单测覆盖 —— 测试只需要构造 `FileSet`，不需要伪造文件系统。这条边界一旦被打破（有人在 `Compile` 里读文件），第 16 节的陷阱 9 就会重现。
 
 ### Registry（协议工厂注册表）
 
@@ -215,23 +275,33 @@ type InboundFactory func(ctx context.Context, spec IRS inbound.Inbound, opts Dep
 - 核心引擎（`engine`、`relay`、`router`）**永远不 import 具体协议包**，只 import `registry` 与接口定义
 - 副作用：新增协议时，唯一不会被修改的核心文件是 `cmd/lipd`（通过 blank import 汇总注册）
 
-### Bootstrap
+### Bootstrap（已废除）
 
-`internal/bootstrap` 只做一件事：把 `liproxy.toml` 读成 `BootstrapConfig`。它包含 10 个字段（listen / port / auth.enabled / auth.username / auth.password / tls.enabled / tls.cert / tls.key / database.path / log.level / log.file）。
+旧设计中 `internal/bootstrap` 是一个只解析"10 个引导字段"的特殊通道，业务配置走数据库。**该包已被删除**，不存在"引导配置"与"业务配置"两条路径：
 
-- Bootstrap **不参与**运行时配置编译，编译输入只有数据库
-- 唯一例外是认证：引导阶段的管理员密码会写入数据库，之后数据库为准
-- 修改 `BootstrapConfig` 字段 = 修改用户可见的配置契约，必须同步更新 README 的字段表
+- 所有配置（监听地址、认证、日志、节点、规则、DNS…）都在同一套文件与同一套合并规则里
+- `config` 包是唯一的配置入口，没有例外通道
+- 若某个字段需要在数据库可用之前就生效（例如 `database.path` 本身），它仍然是主配置里的普通字段，只是被加载流程更早读取 —— 不因此获得特权地位
 
-### Version（版本管理）
+### 运行时状态与历史（Database）
 
-每次对业务配置的写入都会生成一个新的 version 记录：
+数据库不再承载业务配置，它只回答"运行期间发生了什么"：
 
-- 表结构：`versions(id, created_at, author, message, snapshot)`
-- `snapshot` 存编译前的最小配置快照（JSON），不是整库备份
-- 支持 `diff`（两个 version 的结构化差异）、`rollback`（把快照重新写入配置表并生成新 version）、`export`
-- **回滚不是删除**：回滚同样产生新 version，历史永远只增不减
-- 版本生成必须在同一事务内完成：写配置表 + 写 version 记录要么都成功要么都失败
+| 表 | 用途 | 权威性 |
+| --- | --- | --- |
+| `sessions` | Web 登录会话 | 运行时状态 |
+| `api_keys` | API Key（哈希存储） | 运行时状态 |
+| `audit_logs` | 审计记录，只增不删 | 运行时状态 |
+| `runtime_state` | 当前加载的文件集合指纹、启动时间、选中节点等 | 运行时状态 |
+| `traffic_logs` | 流量计量明细（服务端模式） | 运行时状态 |
+| `users` | 服务端模式的多用户与配额 | 运行时状态 |
+
+关键点：
+
+- **`config_versions` 表已删除**。配置历史的权威载体是用户自己的文件，不是数据库。想要版本管理，用户应该用 Git 管 `~/.li/liproxy/`，而不是让 LiProxy 造一个平行版本库
+- `runtime_state.config_fingerprint` 记录**当前生效 IR 的来源文件指纹**（排序后的路径 + 内容 sha256），用于判断热重载是否真的需要发生，以及排查"我改了文件为什么没生效"
+- `database.enabled = false` 时，`internal/db` 完全不被实例化，以上功能按降级语义运行（无会话持久化、无审计落库、流量只累计在内存）
+- **数据库不可用绝不能导致配置不可用**：配置来自文件，数据库只是旁路。这是与旧设计最本质的差别
 
 ### Provider
 
@@ -381,12 +451,21 @@ make dev
 | `make bench` | 运行基准测试并输出内存分配报告 |
 | `make clean` | 清理 `bin/`、`web/dist/` 与测试缓存 |
 
-**数据库调试**
+**配置与状态调试**
 
 ```bash
-sqlite3 ~/.li/liproxy/liproxy.db ".tables"
-sqlite3 ~/.li/liproxy/liproxy.db "SELECT id, message, created_at FROM versions ORDER BY id DESC LIMIT 10;"
+# 配置：查看合并后的最终结果（不启动服务）
+lip config show                  # 打印当前生效的 IR（等价于 TOML/YAML）
+lip config show --format yaml    # 以 YAML 形式导出
+lip config sources               # 打印每个字段来自哪个文件、第几行
+lip config check                 # 校验但不启动
+
+# 运行时状态（数据库只是旁路）
+sqlite3 ~/.li/liproxy/state/li.db ".tables"
+sqlite3 ~/.li/liproxy/state/li.db "SELECT * FROM runtime_state;"
 ```
+
+`lip config sources` 是排查配置问题时最常用的命令：它回答"这个值到底是谁写的"，包括 include 链上每一层的贡献。
 
 ---
 
@@ -455,7 +534,7 @@ internal/inbound/foo/
 
 **第 3 步：实现 IR 配置结构**
 
-在 `internal/config/ir.go` 中新增配置结构，并在 `Compile` 中补上从数据库快照到该结构的转换分支。**注意兼容性规则见第 12 节。**
+在 `internal/config/` 下新增该协议的 IR 结构，并在 `Compile` 中补上"中间结构 → IR"的转换分支。协议字段同时要在 TOML 与 YAML 两侧都能解析（见第 21 节的双格式同构要求）。**注意兼容性规则见第 12 节。**
 
 **第 4 步：自注册**
 
@@ -472,11 +551,12 @@ func init() {
 在 `internal/registry/all/all.go`（聚合注册入口）中添加 `_ "github.com/LiStudioorg/liproxy/internal/inbound/foo"`。
 **不要**在 `engine`、`relay`、`router` 中 import 该包。
 
-**第 6 步：数据库侧**
+**第 6 步：配置与前端**
 
-- 协议类型枚举在 `internal/db/enum.go` 中登记（如需要）
-- 若协议有专属字段，新增迁移（见第 11 节），并在 Web 表单中暴露
-- 前端在 `web/src/pages/nodes/forms/` 下新增表单片段，并在协议下拉中登记
+- 协议类型名登记在 `internal/config/protocol.go` 的枚举里，TOML/YAML 解析与校验共用这一处
+- 若协议有专属字段，在 `internal/config` 的结构体与校验规则中补齐，**不需要数据库迁移**（协议配置不进库）
+- 在 `docs/protocols/foo.md` 补字段表，并在 README 的协议列表中登记
+- 前端在 Web 的节点只读视图与「配置片段编辑提示」中登记该协议名
 
 **第 7 步：测试**
 
@@ -536,9 +616,20 @@ r.Route("/api/v1", func(r chi.Router) {
 
 每个写操作必须声明所需 scope（`nodes:write`、`dns:write`、`users:admin` 等）。新增 scope 需同步更新 `internal/auth/scope.go` 与 Web 的 API Key 管理界面。
 
-**第 6 步：版本记录**
+**第 6 步：区分只读与可写接口**
 
-任何修改业务配置的写接口，必须在同一事务内生成新 version（调用 `config.Service.Commit(ctx, message, mutateFn)`），不要自己写 version 记录。
+这是本次架构调整后最容易写错的地方，写接口必须先过这道判断：
+
+| 接口类型 | 例子 | 实现方式 |
+| --- | --- | --- |
+| **只读配置** | `GET /api/v1/config`、`GET /api/v1/nodes`、`GET /api/v1/rules` | 只读当前 IR，**不碰文件** |
+| **写运行时覆盖** | `POST /api/v1/overrides`、`PATCH /api/v1/runtime/active-node` | 只写 `state/overrides.toml`，字段必须在白名单内 |
+| **写运行时状态** | `POST /api/v1/auth/login`、`POST /api/v1/api-keys` | 写数据库（或内存，当数据库禁用时） |
+| **导出/导入** | `POST /api/v1/config/export`、`POST /api/v1/config/import` | 导出返回文本；导入**只返回合并预览**，落盘由用户自己做 |
+
+**禁止**出现任何直接写主配置、`toml.d/`、`yaml.d/` 的 API。发现了就是架构违规，不是"功能增强"。
+
+覆盖白名单是硬编码的字段集合（如 `log.level`、`runtime.active_node`、`runtime.temp_rules`），实现上是一个显式的 map，新增字段必须同时改这里与文档。
 
 **第 7 步：错误映射**
 
@@ -557,6 +648,8 @@ r.Route("/api/v1", func(r chi.Router) {
 ---
 
 ## 11. 数据库迁移规范
+
+> 适用范围：**仅运行时状态表**（见第 5 节）。业务配置不进数据库，因此新增协议、新增节点字段、新增规则类型**都不需要迁移** —— 只需要改 `internal/config`。这条边界务必记牢，它是本次架构调整的核心收益。
 
 **文件组织**
 
@@ -599,7 +692,9 @@ func TestMigration0012(t *testing.T) {
 
 **版本表**
 
-SQLite 使用 `schema_migrations(version INTEGER PRIMARY KEY, applied_at TIMESTAMP)` 记录已应用版本。启动时自动迁移；迁移失败必须**拒绝启动**并打印明确错误，不要静默继续。
+SQLite 使用 `schema_migrations(version INTEGER PRIMARY KEY, applied_at TIMESTAMP)` 记录已应用版本。启动时自动迁移。
+
+但注意语义变化：数据库是可选的，所以"迁移失败拒绝启动"只在 `database.enabled = true` 时成立。数据库启用但迁移失败时，**拒绝启动**并打印明确错误，不要静默继续，也不要"降级为无数据库运行" —— 后者会让用户以为审计与配额正常工作，实际在静默丢数据。
 
 ---
 
@@ -612,7 +707,7 @@ IR 是引擎与配置之间的契约，也是导入导出的中间格式。变�
 1. 新字段必须是**可选**的，零值必须有明确且向后兼容的语义
 2. 在结构体注释中标注引入版本：`// Since v0.4`
 3. 反序列化时，旧快照缺失该字段 → 取零值 → 使用默认行为，不得报错
-4. 同步更新：DB 迁移、Compile 转换、导入器、导出器、Web 表单、API DTO
+4. 同步更新：TOML 解析、YAML 解析、`Compile` 转换、导出器、Web 只读视图、API DTO（**不再涉及 DB 迁移**）
 
 **修改字段语义（危险）**
 
@@ -626,15 +721,17 @@ IR 是引擎与配置之间的契约，也是导入导出的中间格式。变�
 
 **兼容性检查清单**
 
-- [ ] 旧版本导出的 JSON / YAML 能被新版本正确导入
-- [ ] 旧版本数据库快照（versions 表）能被新版本编译
+- [ ] 旧版本导出的 TOML / YAML 能被新版本正确导入
+- [ ] 用户手写的旧格式配置文件仍然能被解析（这是最重要的兼容性来源）
 - [ ] 新版本导出的配置，在旧版本中导入的行为是"忽略未知字段"而非崩溃
-- [ ] 往返测试：`import → IR → export → import` 结果一致（加一个 round-trip 测试）
+- [ ] 往返测试：`load → IR → export → load` 结果一致（必须有 round-trip 测试）
+- [ ] 同一份配置用 TOML 写与用 YAML 写，编译出的 IR **完全相等**（双格式同构测试）
 
 **编译期不变量**
 
-- `Compile` 必须是纯函数：相同输入产生相同输出，不读全局状态、不发网络请求
-- `Compile` 失败必须返回带上下文的错误，指出是哪张表/哪个字段有问题，便于 Web 端定位
+- `Compile` 必须是纯函数：相同 `FileSet` 产生相同 IR，不读文件系统、不读全局状态、不发网络请求
+- `Compile` 失败必须返回带上下文的错误，指出**是哪个文件、第几行、哪个字段**有问题 —— 用户看不到数据库，只能看文件和日志，错误信息必须精确定位到文件
+- 校验失败时**保留上一份可用 IR**，服务继续以旧配置运行，而不是崩溃或清空配置
 
 ---
 
@@ -786,14 +883,14 @@ Closes #210
 
 ## 16. 常见陷阱
 
-**1. 不要直接操作数据库表，先改 IR。**
-配置类数据的唯一正确路径是：Web/API → 服务层 → 写入配置表 + 生成 version → `Compile` 出新的 IR → 引擎热重载。绕过 IR 直接写表，会导致引擎看不到变更或版本历史断裂。
+**1. 不要绕过 IR 直接改文件或内存结构。**
+配置类数据的唯一正确路径是：文件 → `Load`（展开 + 读取）→ `FileSet` → `Compile`（合并 + 校验）→ IR → 引擎热重载。绕过 `FileSet` 直接拼 IR，或在引擎里临时改写配置，都会让"配置文件是权威源"这条承诺失效，也让热重载与指纹比对失灵。
 
 **2. 不要在 `engine` / `router` / `relay` 中 import 具体协议包。**
 协议只能通过 `registry` 创建。一旦核心引擎依赖具体协议，精简版构建（`build-minimal`）就会失效，且会出现循环依赖。
 
-**3. 不要忘记在服务层记录 version。**
-任何修改业务配置的写操作，如果不生成 version，用户就失去了回滚能力。不要手写 version 记录，统一走 `config.Service.Commit`，它保证同事务。
+**3. 不要让 Web 写配置文件。**
+Web 的唯一写路径是 `state/overrides.toml` 的运行时白名单字段。任何"顺手帮用户把改动写回 `liproxy.toml`"的实现，都会让 LiProxy 变成配置文件的第二个写入者，用户用 Git 管理配置时必然冲突。导出与导入预览是允许的，落盘必须由用户自己做。
 
 **4. 不要在热路径分配内存。**
 `relay` 的转发循环、`router` 的匹配函数、`sniffer` 的解析函数都会被调用百万次。任何 `fmt.Sprintf`、`json.Marshal`、临时切片都会直接反映到内存指标上。写之前先问：这段代码每连接执行几次？
@@ -811,7 +908,7 @@ SQLite 的 `DROP COLUMN` 在旧版本上行为不一致，且会让旧版本程�
 给已有字段补默认值、改类型、改语义，都会让用户的历史版本快照编译出错或行为突变。新增字段永远比修改字段安全。
 
 **9. 不要在 `Compile` 中做 IO。**
-`Compile` 必须是纯函数。需要拉取数据（如 Provider）请在服务层完成并把结果作为输入传入。否则热重载会在网络抖动时失败。
+`Compile` 必须是纯函数，只接受已读取完毕的 `FileSet`。读文件、展开 include、拉取远程片段都必须发生在 `Load` 阶段。否则"相同输入相同输出"不再成立，热重载会在网络抖动或磁盘权限变化时表现不可预测。
 
 **10. 不要在没有 context 的情况下启动 goroutine。**
 每个 goroutine 都要能退出，否则热重载会泄漏 goroutine，长时间运行后内存只增不减。
@@ -840,6 +937,15 @@ TanStack Query 负责缓存与失效。两套缓存并存必然出现"数据不�
 **18. 不要在 `/api/` 路径上做 SPA fallback。**
 `/api/v1/*` 路由必须注册在静态资源与 fallback 之前，未命中的 API 路径要返回 JSON 错误体而不是 `index.html`。否则前端会把 HTML 当成 JSON 解析，报出难以定位的错。详见第 19 节。
 
+**19. 不要用未解析符号链接的路径做循环检测。**
+include 环检测必须 `EvalSymlinks` 之后再比较规范化绝对路径，否则 `a.toml → link/b.toml` 与 `link/b.toml → a.toml` 这类环检测不出来，会无限递归。同理，include 深度上限（32 层）与通配符展开上限（1000 文件）都必须真实生效，超限时报明确错误，不能静默截断。
+
+**20. 不要让单个片段文件解析失败拖垮整份配置。**
+`toml.d/` 里某个文件语法写错时，正确行为是：报出**该文件与行号**，保留上一份可用 IR 继续运行，并在 Web 顶部显示降级告警。直接 panic、退出、或静默跳过该文件都是错的 —— 静默跳过会让用户以为配置已经生效。
+
+**21. 不要把 overrides 当成第二个配置源。**
+`state/overrides.toml` 只允许承载运行时白名单字段。一旦有人往里面塞节点、规则或 DNS 配置，"配置文件是唯一权威源"就不成立了，用户会陷入"我在 liproxy.toml 里改了但没生效"的困境。白名单是显式 map，加字段必须同时改代码与文档。
+
 ---
 
 ## 17. AI 协作提示
@@ -850,7 +956,7 @@ TanStack Query 负责缓存与失效。两套缓存并存必然出现"数据不�
 
 - 新增协议/出站/入站的**样板代码**（在已有协议基础上复制并改写）
 - 表驱动测试用例补齐、错误路径测试
-- 数据库迁移文件（结构明确的加表/加列）
+- 数据库迁移文件（**仅限运行时状态表**：会话、审计、流量、订阅缓存）
 - DTO 定义与 API handler 骨架
 - 前端表单、列表、设置页面（有明确的接口契约时）
 - 文档、注释、CHANGELOG 更新
@@ -871,13 +977,14 @@ TanStack Query 负责缓存与失效。两套缓存并存必然出现"数据不�
 2. **测试**：`make test-race` 必须通过；新功能必须自带上文提到的测试
 3. **lint**：`make lint` 必须通过
 4. **一致性检查**：确认没有违反第 16 节任一陷阱
-5. **契约同步**：改了 API 就更新前端类型；改了 IR 就更新导入导出与测试；改了引导字段就更新 README 字段表
+5. **契约同步**：改了 API 就更新前端类型；改了 IR 就更新 TOML/YAML 双格式解析与测试；改了配置字段就更新 README 的完整字段表
 6. **自我声明**：在 PR 描述中说明哪些部分是 AI 生成的、哪些部分人工验证过
 
 **AI 工具使用禁令**
 
 - 禁止在未阅读目标包 `doc.go` 与相邻实现的情况下生成新文件
 - 禁止虚构不存在的依赖、函数或配置字段 —— 不确定时先读代码，不要猜
+- **禁止把配置写回数据库**。历史遗留的 `db.Node` / `config_versions` / `config.Service.Commit` 这类写法已经废除，见到就说明你参考了过时的上下文
 - 禁止生成占位实现（`// TODO: implement`、返回零值的假实现）并声称功能完成
 - 禁止跳过测试直接声称"已修复"
 - 禁止为了让测试通过而修改测试的期望值（除非明确说明并给出理由）
@@ -1156,33 +1263,38 @@ cp bin/lipd /tmp/lip-smoke/ && cd /tmp/lip-smoke && ./lipd
 
 Phase 只定义**边界与出口标准**，不规定实现细节。每个 Phase 内部再拆成最小可交付单元，串行推进，每单元一次 review。
 
-### Phase 1 — 可用骨架（Skeleton）
+> 本次架构调整把"配置内核"提前了：先有可用的配置加载与 IR，再有 Web 与引擎。顺序反过来会导致大量返工。
 
-**目标**：`make build` 产出的 `bin/lipd` 拷到干净目录能独立启动，浏览器打开能看到 Vue 界面并完成一次登录。
+### Phase 1 — 配置内核（Config Core）★ 当前阶段
+
+**目标**：`lip config show` 能把 `~/.li/liproxy/` 下的多来源配置合并成一份 IR 并打印出来，不含任何引擎与网络能力。
+
+| 出口标准 | 验证方式 |
+| --- | --- |
+| 5 层优先级正确，`lip config sources` 能指出每个字段的来源文件与行号 | 优先级表驱动测试 |
+| 主配置 TOML/YAML 二选一，同时存在时忽略 YAML 并 warn | 单测 |
+| include 支持单文件 / 通配符 / `exclude` / `optional` / 跨格式 | 表驱动测试 |
+| 符号链接环与普通环均被检出，错误含完整引用链 | 环检测测试（含 `EvalSymlinks` 用例） |
+| 深度 32 / 通配符 1000 上限真实生效 | 边界测试 |
+| 数组追加、map 深合并、同名 outbound 报错并含两组行号 | 合并测试 |
+| 同一配置的 TOML 与 YAML 表达编译出**深度相等**的 IR | 双格式同构测试 |
+| 校验失败保留上一份可用 IR | 单测 |
+
+**不含**：Web 界面、数据库、任何协议、引擎、转发。
+
+### Phase 2 — 骨架与可观测（Skeleton & Observability）
+
+**目标**：`bin/lipd` 拷到干净目录能独立启动，浏览器能看到 Vue 界面并看到当前 IR。
 
 | 出口标准 | 验证方式 |
 | --- | --- |
 | 单二进制可独立运行 | 19.5 的干净目录冒烟测试 |
-| `liproxy.toml` 10 字段可解析，非法组合拒绝启动 | bootstrap 表驱动测试 |
-| 数据库自动迁移，失败拒绝启动 | 迁移测试三件套 |
-| 管理员账号首次启动生成随机密码，只打印一次 | auth 测试 + 日志断言无密码原文 |
-| Web 登录 → 概览页可访问 | 端到端冒烟 |
+| 配置加载失败时服务仍可用，Web 顶部显示降级告警 | 端到端冒烟 |
+| 登录 → 只读配置视图可访问 | 端到端冒烟 |
 | `/api/v1/*` 返回 JSON，前端深链返回 index.html | 19.5 的三条断言 |
+| 数据库可关闭：`database.enabled = false` 时不创建库也能启动 | 启动测试 |
 
-**不含**：任何真实代理协议、规则引擎、Provider 拉取、DNS、流量统计。
-
-### Phase 2 — 配置内核（Config Core）
-
-**目标**：IR 成为唯一配置表示，版本管理闭环。
-
-| 出口标准 | 验证方式 |
-| --- | --- |
-| `config.Compile` 纯函数，DB 快照 → IR | 单测 + 相同输入相同输出断言 |
-| 写操作同事务生成 version，失败全回滚 | 并发写测试（version 不串号） |
-| diff / rollback / export 可用 | round-trip 测试：import → IR → export → import |
-| 版本历史可在 Web 查看与回滚 | 端到端 |
-
-**不含**：引擎热重载（Phase 3）、真实协议。
+**不含**：任何真实代理协议、规则匹配、Provider 拉取、DNS。
 
 ### Phase 3 — 引擎与首个协议（Engine + First Protocol）
 
@@ -1192,7 +1304,8 @@ Phase 只定义**边界与出口标准**，不规定实现细节。每个 Phase 
 | --- | --- |
 | registry 自注册生效，核心引擎零协议 import | `go list -deps` 断言 |
 | 至少一个协议完成回环测试（1 MB 随机数据） | 回环测试 |
-| 热重载：旧连接优雅关闭，goroutine 不泄漏 | 连续热重载 + goroutine 计数断言 |
+| 改配置文件后热重载生效，旧连接优雅关闭，goroutine 不泄漏 | 连续热重载 + goroutine 计数断言 |
+| 指纹未变时不触发重建 | 单测 |
 | relay 转发有 benchmark 基线 | `make bench` 报告入 PR |
 
 **风险**：这一 Phase 触及 `relay` / `router` / `bufpool`，属于"必须人工 review"范围。
@@ -1201,7 +1314,7 @@ Phase 只定义**边界与出口标准**，不规定实现细节。每个 Phase 
 
 **目标**：协议覆盖面对齐 Mihomo 客户端能力。
 
-按 AGENTS.md 第 9 节的九步流程逐个协议推进，每个协议一个 PR。**每个协议的体积增量都要单独测量并记录。**
+按第 9 节的九步流程逐个协议推进，每个协议一个 PR。**每个协议的体积增量都要单独测量并记录。**
 
 **不含**：服务端多用户、订阅分发（Phase 5）。
 
@@ -1215,10 +1328,164 @@ Phase 只定义**边界与出口标准**，不规定实现细节。每个 Phase 
 | 流量计量异步批量写回，不影响转发路径 | 转发路径 benchmark 无分配回归 |
 | 订阅生成三种格式（clash / v2ray / sing-box） | 格式快照测试 |
 | ACME 自动申请与续期 | 使用测试目录（禁止真实外网） |
+| 数据库不可用时服务端模式明确拒绝启动（而非静默降级） | 启动测试 |
 
 ### 贯穿所有 Phase 的常驻要求
 
 - 每个 Phase 结束时更新 README 与 AGENTS.md，文档与代码不允许漂移
 - 内存指标在 Phase 3 之后每个 PR 都要有数据，不允许"先涨上去以后再优化"
 - 任何新增依赖都走第 18 节的许可证准入
+- 任何"让 Web 写配置文件"的提案都需要先修订本文件，而不是直接实现
 
+---
+
+## 21. 配置加载规范
+
+这是本项目最核心的一节。配置是权威源，所以加载顺序、合并语义、错误处理都必须精确到可测试。
+
+### 21.1 文件布局与加载优先级
+
+```text
+优先级从低到高（后者覆盖前者）
+
+1. 内置默认值（编译进二进制，保证空配置也能启动）
+2. 主配置：liproxy.toml，若不存在则用 liproxy.yaml（二选一，不共存）
+3. toml.d/*.toml   按文件名字典序（byte-wise，等价于 sort）
+4. yaml.d/*.yaml   按文件名字典序
+5. state/overrides.toml   仅运行时白名单字段（见 21.6）
+```
+
+两条硬规则：
+
+- **主配置二选一**：`liproxy.toml` 存在时**完全忽略** `liproxy.yaml`。两个都在时在日志里给一条 `warn`，指明被忽略的那个路径。不做"两个都加载再合并"——那会让"我改了 yaml 为什么没生效"变成一个无解的问题。
+- **字典序是 byte-wise 排序**，不是本地化排序。这样 `10-a.toml` 排在 `9-a.toml` 前面，行为在所有机器上一致。想控制顺序就**用零填充前缀**（`001-`、`002-`），并在文档里明确写出这个约定。
+
+### 21.2 include
+
+主配置与所有片段都可以含 `include`。include 在**解析阶段递归展开**，深度优先。
+
+```toml
+include = [
+  "extra/nodes.toml",              # 单文件，相对当前文件所在目录
+  "rules/*.toml",                  # 单层通配符
+  "providers/**/*.yaml",           # 递归通配符
+  "conf/{dns,log}.toml",           # 花括号展开
+  "local.toml?",                   # ? = 单个字符
+]
+
+# 排除（在展开结果上执行）
+exclude = ["providers/**/disabled-*.yaml"]
+
+# 结构化 include：需要跨格式或可选时用这种写法
+[[include]]
+path     = "remote/rules.yaml"
+format   = "yaml"                  # 显式指定格式，覆盖扩展名推断
+optional = true                    # 不存在则跳过，不报错
+```
+
+**通配符支持**：`*`（单层）、`**`（递归）、`?`（单字符）、`{a,b}`（枚举）。`**` 标准库不支持，需自己实现 —— 实现方式是把 pattern 按 `**` 切段，逐段用 `filepath.Glob` 展开。**不要**为此引入第三方 glob 库（见第 4 节依赖准入）。
+
+**格式判定顺序**：
+1. 显式 `format = "yaml" | "toml"`
+2. 扩展名 `.toml` / `.yaml` / `.yml`
+3. 都判定不出来 → 报错，不猜
+
+**远程 include（默认关闭）**：必须同时显式开启 `allow_remote = true` 且给出 `sha256` 或 `cache_ttl`，否则拒绝加载。远程内容缓存在 `state/` 下，本地副本是编译输入 —— 这样 `Compile` 依然是纯函数，也不会因为网络抖动导致热重载失败。
+
+### 21.3 三道防线（必须有测试）
+
+| 防线 | 上限 | 超限行为 |
+| --- | --- | --- |
+| 循环引用 | 不允许 | 报错并打印**完整引用链**（`a.toml → b.toml → a.toml`） |
+| include 深度 | 32 层 | 报错并指出达到上限的那条链 |
+| 通配符展开文件数 | 1000 个 | 报错并建议收窄 pattern |
+
+**循环检测实现要点**：键必须是 `EvalSymlinks` 之后的规范化绝对路径。直接用 `filepath.Clean` 不够 —— `a.toml → link/b.toml → a.toml` 这种经符号链接的环会被漏掉，表现为无限递归直到栈溢出。同时维护一个"当前递归栈"（用于报环）与一个"已访问集合"（用于去重），两者语义不同，不要合并。
+
+### 21.4 合并策略
+
+合并**只在 IR 层执行一次**，TOML 与 YAML 不走各自的合并逻辑。
+
+| 类型 | 策略 |
+| --- | --- |
+| Map / 结构体 | 深度合并；同名标量后者覆盖前者 |
+| List / 数组 | **默认追加**（不是替换！） |
+| 标量 | 后者覆盖前者 |
+| `rules` | 追加，但可用 `position = "prepend" \| "append"` 控制插入端 |
+| 同名 outbound / provider / inbound（按 tag 或 name） | **报错**，并指出两个来源文件的路径与行号 |
+
+**为什么数组默认追加**：配置文件天然是"多来源拼装"的，`toml.d/` 里每个文件通常只贡献几条规则或节点。默认替换会让后加载的文件把前面的整个列表抹掉，这是最容易踩的坑。需要替换语义时用显式标记，不要靠默认行为。
+
+**同名冲突为什么报错而不是覆盖**：节点 tag 是规则引用出站的唯一凭据。静默覆盖会让"规则指向了另一个节点"这种 bug 极难排查。报错时必须给出**两份来源**（文件 + 行号），而不是只报一个。
+
+### 21.5 校验与错误信息
+
+校验规则只有一份，TOML 与 YAML 共用。校验在合并**之后**执行，因为只有合并后才知道最终值。
+
+错误信息的最低要求（这是用户唯一能看到的定位手段）：
+
+```text
+config: invalid value for "inbounds[0].listen": port 0 is not allowed
+  --> /home/u/.li/liproxy/toml.d/010-inbound.toml:12
+  --> also set in /home/u/.li/liproxy/liproxy.toml:8 (overridden)
+```
+
+- 必须给出**文件路径 + 行号**，行号在解析阶段就要记录下来（provenance）
+- 被覆盖的值要一并列出，否则用户不知道自己在改哪个文件
+- 校验失败**不清空配置**：保留上一份可用 IR 继续运行（见第 12 节）
+
+### 21.6 overrides 白名单
+
+`state/overrides.toml` 由 Web 写入，只允许**运行时字段**：
+
+| 允许 | 不允许 |
+| --- | --- |
+| `log.level` | 任何 `inbounds` / `outbounds` / `nodes` |
+| `runtime.active_node`（当前选中的出站 tag） | 任何 `rules` / `rule_sets` |
+| `runtime.temp_rules`（内存态临时规则） | 任何 `dns` / `providers` / `tls` 配置 |
+| `runtime.mode`（rule / global / direct） | 任何监听地址与端口 |
+
+实现要求：
+
+- 白名单是代码里的**显式 map**，不是"反射后排除业务字段"
+- 写入流程：校验白名单 → 备份到 `backups/` → 临时文件 + `rename` 原子替换 → 重新编译 → 失败则回滚
+- 文件头必须带注释说明"此文件由 Web 生成，业务配置请改主配置或 *.d/"，避免用户误以为这是主配置
+
+### 21.7 热重载
+
+| 触发方式 | 用途 |
+| --- | --- |
+| 文件监听（fsnotify 语义，自实现或标准库 + 轮询） | 编辑配置后自动生效 |
+| `SIGHUP` | 容器内、或监听不可靠时的手动触发 |
+| `lip reload` | 通过本地 API 触发 |
+| Web 写 overrides 后 | 同上，走同一套流程 |
+
+流程与约束：
+
+1. 重新执行 `Load` → 计算**文件指纹**（排序后的 `路径 + sha256`）
+2. 指纹未变 → 直接返回，不做任何重建（避免无意义的热重载抖动）
+3. 指纹变了 → `Compile`；失败则**保留旧 IR**，记 error 日志，Web 顶部挂降级告警
+4. 成功 → 原子替换 IR → 优雅关闭旧实例（先停止接受新连接，再等存量连接，带超时上限）
+5. 热重载期间**不接受新的热重载请求**（串行化），避免并发重建导致 goroutine 泄漏
+
+### 21.8 测试要求
+
+配置加载是本项目测试最密集的地方，必须覆盖：
+
+- **优先级**：同样字段在 5 个层级各写一次，断言胜出者与 `lip config sources` 输出一致
+- **主配置二选一**：两个主配置同时存在时，被忽略的是 YAML，且有 warn 日志
+- **字典序**：`10-` 排在 `9-` 之前（固化 byte-wise 语义）
+- **include 环**：`a → b → a` 必须报错且错误信息含完整链
+- **符号链接环**：`a → link/b → a` 同样必须被检出（这是最容易漏的用例）
+- **深度上限**：33 层报错，32 层通过
+- **通配符上限**：1001 个文件报错
+- **合并语义**：数组追加、map 深合并、同名 outbound 报错并含两个来源行号
+- **双格式同构**：同一份配置分别用 TOML 与 YAML 表达，编译出的 IR 必须**深度相等**
+- **往返**：`load → IR → export → load` 结果一致
+- **overrides 白名单**：写业务字段必须被拒绝
+- **失败保留旧 IR**：坏配置文件不会导致服务不可用
+- **纯函数性**：相同 `FileSet` 编译两次，结果深度相等
+
+所有涉及文件的用例一律使用 `t.TempDir()`，禁止读取真实 `~/.li/`。
+
+---

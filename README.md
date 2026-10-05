@@ -2,7 +2,9 @@
 
 **一个 Web 驱动的全能代理平台 —— 一个二进制文件，一个浏览器标签页，搞定所有代理。**
 
-LiProxy 把 Mihomo 级别的客户端能力和 sing-box 级别的服务端能力装进同一个 Go 二进制里，并且用 Web 界面替代了手写 YAML。你不再需要编辑几千行配置文件：配置存在数据库里，Web 就是唯一主入口。
+LiProxy 把 Mihomo 级别的客户端能力和 sing-box 级别的服务端能力装进同一个 Go 二进制里。
+
+**配置就是文件，且永远是你自己的文件。** 所有业务配置写在 `~/.li/liproxy/` 下的主配置与 `toml.d/` `yaml.d/` 片段里，可以用 Git 管理、可以 code review、可以随时手改。Web 界面负责**看**和**调运行时**（切节点、临时规则、日志级别），它不会偷偷改写你的配置文件。
 
 [![Go Version](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
@@ -49,10 +51,19 @@ LiProxy 把 Mihomo 级别的客户端能力和 sing-box 级别的服务端能力
 
 ### Web 界面
 
-- 节点、规则、Provider、DNS、用户、流量全部图形化管理
-- **版本管理**：每次修改自动生成新版本，支持 diff、一键回滚、导出
-- **实时流量图**：基于 WebSocket 的连接列表与速率曲线
+Web 是**观察台 + 运行时调节器**，不是配置编辑器：
+
+- **只读**：当前生效的 IR、节点、规则、Provider、DNS、连接列表、实时流量曲线、日志
+- **可写**：只写 `state/overrides.toml` 里的运行时字段 —— 切换当前节点、临时规则、日志级别、运行模式
+- **不写**：主配置与 `toml.d/` `yaml.d/` 里的任何文件。你的配置文件只有一个写入者，就是你自己
 - 支持 PWA，可安装到桌面/手机，离线也能打开面板
+
+配套两条命令，让文件与界面互相印证：
+
+```bash
+lip config show       # 打印当前生效的完整配置（合并后的结果）
+lip config sources    # 打印每个字段来自哪个文件、第几行
+```
 
 ---
 
@@ -106,7 +117,7 @@ sudo install -m 0755 bin/lip  /usr/local/bin/lip
 lipd
 ```
 
-首次启动时 LiProxy 会创建数据目录、初始化数据库并生成随机管理员密码，控制台输出如下：
+首次启动时 LiProxy 会创建数据目录、生成一份默认配置与随机管理员密码，控制台输出如下：
 
 ```text
 2026-01-01T12:00:00+08:00 INF LiProxy v0.1.0 (commit 0a1b2c3, go1.22.5)
@@ -138,26 +149,87 @@ lip passwd --reset    # 重置为新的随机密码并打印到控制台
 
 ---
 
-## 配置文件说明
+## 配置说明
 
-LiProxy 有且只有一个配置文件：`~/.li/liproxy/liproxy.toml`。
-它**只负责进程如何启动**（监听地址、认证入口、数据库位置、日志）。节点、规则、DNS、Provider、用户、流量等全部存在数据库中，通过 Web 管理。
+LiProxy 的配置**就是文件**，没有第二份藏在数据库里。
 
-### 字段一览（共 10 个）
+### 目录布局
 
-| 段落 | 字段 | 类型 | 默认值 | 说明 |
-| --- | --- | --- | --- | --- |
-| `[server]` | `listen` | string | `127.0.0.1` | Web 服务监听地址。对外开放填 `0.0.0.0`，但务必同时开启认证 |
-| `[server]` | `port` | int | `9090` | Web 服务与 REST API 端口 |
-| `[auth]` | `enabled` | bool | `true` | 是否启用 Web 登录认证。**监听非回环地址时禁止关闭** |
-| `[auth]` | `username` | string | `admin` | 管理员用户名 |
-| `[auth]` | `password` | string | 首次启动随机生成 | 管理员密码。留空表示使用数据库中已保存的密码 |
-| `[tls]` | `enabled` | bool | `false` | 是否为 Web 界面启用 HTTPS |
-| `[tls]` | `cert` | string | `""` | 证书文件路径（PEM） |
-| `[tls]` | `key` | string | `""` | 私钥文件路径（PEM） |
-| `[database]` | `path` | string | `~/.li/liproxy/liproxy.db` | SQLite 数据库文件路径，支持相对路径与 `~` |
-| `[log]` | `level` | string | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
-| `[log]` | `file` | string | `~/.li/liproxy/logs/liproxy.log` | 日志文件路径。留空表示只输出到标准输出 |
+```text
+~/.li/liproxy/
+├── liproxy.toml          # 主配置（TOML，优先）
+├── liproxy.yaml          # 主配置（YAML，仅当 liproxy.toml 不存在时使用）
+├── toml.d/               # TOML 片段，按文件名字典序加载
+├── yaml.d/               # YAML 片段，按文件名字典序加载
+├── state/                # 运行时状态（删掉可重建，不是配置）
+│   ├── li.db             #   会话 · API Key · 审计 · 流量 · 订阅缓存
+│   ├── overrides.toml    #   Web 写入的运行时覆盖
+│   └── fakeip.db         #   Fake-IP 映射
+├── backups/              # 自动备份
+└── logs/                 # 运行日志，按天轮转
+```
+
+`toml.d/` `yaml.d/` 让你把配置拆成小块：一个文件放节点，一个放规则，一个放 DNS。改哪块改哪个文件，不用在几千行里翻找。
+
+### 加载优先级（低 → 高）
+
+| # | 来源 | 说明 |
+| --- | --- | --- |
+| 1 | 内置默认值 | 空配置也能启动 |
+| 2 | `liproxy.toml` **或** `liproxy.yaml` | 二选一；TOML 存在时完全忽略 YAML |
+| 3 | `toml.d/*.toml` | 按文件名字典序 |
+| 4 | `yaml.d/*.yaml` | 按文件名字典序 |
+| 5 | `state/overrides.toml` | Web 写入，**仅运行时白名单字段** |
+
+> 字典序是逐字节比较，所以 `10-a.toml` 排在 `9-a.toml` **前面**。需要严格顺序就用零填充前缀：`001-`、`002-`。
+
+### 合并规则
+
+| 类型 | 行为 |
+| --- | --- |
+| 表 / 结构体 | 深度合并，后者覆盖前者 |
+| 数组 | **默认追加**，不是替换 |
+| `rules` | 追加，可用 `position = "prepend"` 插到前面 |
+| 同名出站 / Provider | **报错**，并指出两个来源文件与行号 |
+
+### include：把配置拆开
+
+```toml
+include = [
+  "extra/nodes.toml",          # 单文件，相对当前文件所在目录
+  "rules/*.toml",              # 单层通配符
+  "providers/**/*.yaml",       # 递归通配符
+  "conf/{dns,log}.toml",       # 花括号展开
+]
+exclude = ["providers/**/disabled-*.yaml"]
+
+# 需要指定格式或允许缺失时用结构化写法
+[[include]]
+path     = "remote/rules.yaml"
+format   = "yaml"
+optional = true
+```
+
+支持 `*`、`**`、`?`、`{a,b}`，可显式指定 `format`，`optional = true` 时文件不存在就跳过。
+
+三道防线保证不会把自己写死：循环引用会被检出并打印完整引用链（含符号链接环）、include 深度上限 32 层、单次通配符展开上限 1000 个文件。
+
+### 配置出错会怎样
+
+**坏配置不会让服务挂掉。** 某个片段文件写错语法时，LiProxy 会报出该文件与行号，**继续使用上一份可用的配置**继续运行，并在 Web 顶部显示降级告警。你可以在线修好文件，热重载会自动生效。
+
+### overrides 里能写什么
+
+Web 唯一能写的地方，且只允许这几个字段：
+
+| 允许 | 含义 |
+| --- | --- |
+| `log.level` | 运行日志级别 |
+| `runtime.mode` | `rule` / `global` / `direct` |
+| `runtime.active_node` | 当前选中的出站 |
+| `runtime.temp_rules` | 内存态临时规则 |
+
+节点、规则、DNS、监听地址**不在**此列 —— 它们只能来自你的配置文件。
 
 ### 完整示例
 
@@ -171,26 +243,37 @@ port   = 9090
 [auth]
 enabled  = true
 username = "admin"
-password = ""          # 留空 = 沿用数据库中已保存的密码
+password = ""          # 留空 = 沿用已有的密码哈希
 
 [tls]
-enabled = false        # 反向代理后面通常保持 false
+enabled = false
 cert    = ""
 key     = ""
 
 [database]
-path = "~/.li/liproxy/liproxy.db"
+enabled = true         # 纯客户端模式可设为 false，不创建数据库
+path    = "~/.li/liproxy/state/li.db"
 
 [log]
 level = "info"
 file  = "~/.li/liproxy/logs/liproxy.log"
 ```
 
-修改配置后重启进程即可生效：
+节点、规则、DNS、入站出站等业务配置同样写在这个文件（或 `toml.d/` `yaml.d/` 片段）里，字段说明见 `docs/`。
+
+### 让改动生效
+
+LiProxy 监听配置文件变化，改完自动热重载，**不需要重启**：
 
 ```bash
-lip restart
-# 或者 systemd
+lip config check      # 先校验，不启动
+lip config sources    # 看这个值到底来自哪个文件
+lip reload            # 手动触发重载（容器里没监听时用）
+```
+
+系统服务模式：
+
+```bash
 sudo systemctl restart liproxy
 ```
 
@@ -200,17 +283,31 @@ sudo systemctl restart liproxy
 
 ![dashboard](docs/images/dashboard.png)
 
+Web 是**观察台 + 运行时调节器**，不是配置编辑器：
+
+- **只读**：当前生效的 IR、节点、规则、Provider、DNS、连接列表、实时流量曲线、日志
+- **可写**：只写 `state/overrides.toml` 里的运行时字段 —— 切换当前节点、临时规则、日志级别、运行模式
+- **不写**：主配置与 `toml.d/` `yaml.d/` 里的任何文件。你的配置文件只有一个写入者，就是你自己
+- 支持 PWA，可安装到桌面/手机，离线也能打开面板
+
+配套两条命令，让文件与界面互相印证：
+
+```bash
+lip config show       # 打印当前生效的完整配置（合并后的结果）
+lip config sources    # 打印每个字段来自哪个文件、第几行
+```
+
 <details>
 <summary>更多截图</summary>
 
 | 页面 | 预览 |
 | --- | --- |
-| 节点管理 | ![proxies](docs/images/proxies.png) |
-| 规则编辑 | ![rules](docs/images/rules.png) |
+| 节点总览（只读） | ![proxies](docs/images/proxies.png) |
+| 规则查看与命中测试 | ![rules](docs/images/rules.png) |
 | 实时连接 | ![connections](docs/images/connections.png) |
-| DNS 设置 | ![dns](docs/images/dns.png) |
+| DNS 状态 | ![dns](docs/images/dns.png) |
 | 服务端用户与流量 | ![users](docs/images/users.png) |
-| 版本历史与回滚 | ![versions](docs/images/versions.png) |
+| 配置来源与运行时覆盖 | ![config](docs/images/config.png) |
 
 </details>
 
@@ -306,15 +403,15 @@ lip import clash config.yaml --dry-run
 
 | Mihomo / Clash | LiProxy |
 | --- | --- |
-| `proxies:` | Provider 或节点列表（数据库） |
+| `proxies:` | Provider 或节点列表（`toml.d/nodes.toml`） |
 | `proxy-groups:` | 策略组（Web 可视化编辑） |
 | `rules:` | 规则引擎（同一套类型语法） |
 | `dns:` | DNS 页面（含 Fake-IP、DoH/DoT/DoQ） |
 | `tun:` | TUN 页面（gVisor / system 双栈可选） |
 | `external-controller` | 内置 Web 界面 + REST API |
-| 控制台改配置 + 重启 | Web 改配置，实时热重载 |
+| 控制台改配置 + 重启 | 改配置文件，实时热重载 |
 
-> 导入的配置会生成一个新版本，可在 **版本历史** 中对比或回滚，不会影响当前运行的配置。
+> 导入只做**合并预览**，不会替你写文件。确认无误后再 `lip export` 落盘 —— 你的配置目录始终只有你自己在写。
 
 ---
 
@@ -324,7 +421,12 @@ lip import clash config.yaml --dry-run
 | --- | --- |
 | `lip start` | 启动代理引擎（前台运行） |
 | `lip stop` | 停止正在运行的引擎 |
-| `lip restart` | 重启引擎（配置变更后使用） |
+| `lip reload` | 手动触发配置热重载（改完文件通常自动生效） |
+| `lip config show` | 打印当前生效的完整配置 |
+| `lip config show --format yaml` | 以 YAML 形式导出当前配置 |
+| `lip config sources` | 打印每个字段来自哪个文件、第几行 |
+| `lip config check` | 校验配置但不启动 |
+| `lip restart` | 重启进程 |
 | `lip status` | 查看运行状态、当前模式、连接数、内存占用 |
 | `lip passwd` | 修改管理员密码 |
 | `lip passwd --reset` | 重置为随机密码并打印 |
@@ -346,7 +448,7 @@ lip import clash config.yaml --dry-run
 | --- | --- |
 | `lipd` | 前台运行守护进程（默认读取 `~/.li/liproxy/liproxy.toml`） |
 | `lipd --config /path/to/liproxy.toml` | 指定配置文件启动 |
-| `lipd --check` | 只校验配置文件与数据库，不启动服务 |
+| `lipd --check` | 只校验配置文件，不启动服务 |
 
 ---
 
@@ -354,18 +456,25 @@ lip import clash config.yaml --dry-run
 
 ```text
 ~/.li/liproxy/
-├── liproxy.toml     # 唯一配置文件（引导参数，10 个字段）
-├── liproxy.db       # 数据库（节点、规则、DNS、用户、流量、版本历史）
-├── backups/         # 自动备份与新版本快照
+├── liproxy.toml     # 主配置：进程参数 + 全部业务配置
+├── liproxy.yaml     # 主配置的 YAML 版本（与 TOML 二选一）
+├── toml.d/          # TOML 配置片段
+├── yaml.d/          # YAML 配置片段
+├── state/           # 运行时状态：数据库、overrides、Fake-IP
+├── backups/         # 自动备份
 └── logs/            # 运行日志，按天轮转，默认保留 7 天
 ```
 
 | 路径 | 是否可手改 | 说明 |
 | --- | --- | --- |
-| `liproxy.toml` | ✅ | 只有它需要手写。改完重启生效 |
-| `liproxy.db` | ❌ | 权威数据源。请通过 Web 或 CLI 修改，不要直接编辑 |
-| `backups/` | ❌ | 每次配置变更自动生成，用于回滚 |
+| `liproxy.toml` / `liproxy.yaml` | ✅ | **权威源**。改完自动热重载 |
+| `toml.d/` `yaml.d/` | ✅ | **权威源**。拆分配置用，按文件名字典序加载 |
+| `state/` | ⚠️ | 运行时状态，删掉会重建（历史流量与审计随之丢失） |
+| `state/overrides.toml` | ⚠️ | 由 Web 生成，手改会被覆盖。业务配置请改上面的文件 |
+| `backups/` | ❌ | 自动生成 |
 | `logs/` | ✅ | 可随时删除，会自动重建 |
+
+**一句话区分**：`liproxy.toml` 与 `*.d/` 没了，你就丢了配置；`state/` 没了，只是丢了历史。
 
 ---
 
@@ -375,13 +484,15 @@ lip import clash config.yaml --dry-run
 
 LiProxy 是独立实现，不复用它们的代码。设计目标是客户端能力对齐 Mihomo（协议覆盖、规则语义、Provider），服务端能力对齐 sing-box（多用户、订阅、DNS 服务器），并在此基础上提供统一的 Web 管理界面和更低的内存占用。它可以导入它们的配置文件，也可以导出成它们的格式。
 
-**Q2：为什么只有一个配置文件？我想用 YAML 管理节点怎么办？**
+**Q2：配置到底存在哪？Web 会不会改我的文件？**
 
-因为手写 YAML 在节点数量上百之后会失控。LiProxy 把"进程怎么跑"和"跑什么配置"彻底分开：前者留在 `liproxy.toml`，后者进数据库由 Web 管理。如果你确实喜欢文件化，用 `lip export` 随时导出，用 `lip import` 随时导入，双向都不锁死。
+存在你自己的文件里 —— `~/.li/liproxy/liproxy.toml` 与 `toml.d/` `yaml.d/`。**Web 不会写这些文件**，它只会写 `state/overrides.toml` 里的运行时字段（切节点、临时规则、日志级别）。这样你可以随时把整个配置目录交给 Git 管理，不会出现"界面上改了一下，diff 里多出一堆看不懂的东西"。
+
+节点多了觉得主配置太长，就拆到 `toml.d/nodes.toml`、`toml.d/rules.toml` 里去。TOML 与 YAML 都支持，混着用也行 —— 两种格式最终编译成同一份 IR，行为完全一致。
 
 **Q3：端口 9090 被占用了怎么办？**
 
-改 `liproxy.toml` 里的 `[server] port`，然后 `lip restart`。如果只是想临时换端口，也可以 `lipd --config /tmp/liproxy.toml` 用一个临时配置文件启动。
+改 `liproxy.toml` 里的 `[server] port`，保存即自动热重载（监听地址变化会重建监听器）。如果只是想临时换端口，也可以 `lipd --config /tmp/liproxy.toml` 用一个临时配置文件启动。
 
 **Q4：忘了管理员密码？**
 
@@ -389,11 +500,13 @@ LiProxy 是独立实现，不复用它们的代码。设计目标是客户端能
 lip passwd --reset
 ```
 
-会生成一个新的随机密码并打印到控制台。如果连 CLI 都用不了，直接删除数据库中的认证记录（或删库重建，代价是配置丢失），重启后会重新走首次启动流程。
+会生成一个新的随机密码并打印到控制台。如果连 CLI 都用不了，删掉 `state/li.db` 即可 —— **你的配置全在 `liproxy.toml` 和 `*.d/` 里，不会丢**，重启后会重新走首次启动流程。
 
 **Q5：把 Web 界面暴露到公网安全吗？**
 
 可以，但必须满足三条：`[auth] enabled = true`、密码足够强、建议在前面加一层 HTTPS 反向代理并把 `[server] listen` 保持为 `127.0.0.1`。LiProxy 在检测到监听非回环地址且关闭认证时会拒绝启动。也可以在 **设置 → API Key** 中生成受限的 API Key 给自动化脚本使用。
+
+注意 Web 本身**不能改业务配置**，所以即使面板被攻破，攻击者也改不了你的节点与规则 —— 这是新架构顺带带来的安全收益。
 
 **Q6：TUN 模式起不来，提示权限不足？**
 
@@ -415,13 +528,37 @@ sudo setcap cap_net_admin,cap_net_raw+ep $(which lipd)
 
 **Q9：如何备份和迁移到另一台机器？**
 
+配置和数据都在一个目录里，整目录拷走即可：
+
 ```bash
 lip stop
 tar czf liproxy-backup.tar.gz -C ~/.li liproxy
-# 在新机器上解开后 lipd 即可，配置与数据完整保留
+# 在新机器上解开后 lipd 即可
 ```
 
-**Q10：支持订阅链接给其他客户端用吗？**
+只想带走**配置**（不含流量与审计历史）的话，拷贝这些就够了，体积也小得多：
+
+```bash
+cp -r ~/.li/liproxy/liproxy.toml ~/.li/liproxy/toml.d ~/.li/liproxy/yaml.d /path/to/dest/
+```
+
+**Q10：我改了配置文件但没生效？**
+
+按顺序查三步：
+
+```bash
+lip config check      # 语法或校验错误会直接指出来
+lip config sources    # 看这个字段最终是谁提供的 —— 很可能被更高优先级的文件覆盖了
+tail -f ~/.li/liproxy/logs/liproxy.log   # 看热重载日志
+```
+
+最常见的原因是优先级：`yaml.d/` 覆盖 `toml.d/`，而 `toml.d/` 覆盖主配置。第二种常见原因是配置有错，LiProxy 保留了上一份可用配置继续运行 —— 这时 Web 顶部会有降级告警。
+
+**Q11：配置写错了会不会把服务搞挂？**
+
+不会。任一文件解析失败时，LiProxy 报出该文件与行号，**继续用上一份可用的配置运行**，并在 Web 顶部显示降级告警。你可以从容地在线修好文件，保存后自动恢复。同理，删掉 `state/` 目录也只是丢历史，配置照样能跑。
+
+**Q12：支持订阅链接给其他客户端用吗？**
 
 支持。服务端模式下，Web **用户** 页面为每个用户生成三个订阅链接（Clash / V2Ray / sing-box），可直接粘贴到对应客户端。
 
