@@ -91,6 +91,25 @@ func (l *loadState) warnInclude(ref ir.SourceRef, msg, pattern string, matched i
 	ev.Msg(msg)
 }
 
+// warnMisfiled emits a non-fatal diagnostic for an include/exclude key that
+// TOML filed inside a table.
+//
+// It is a warning and not an error because the document is valid TOML and the
+// load can proceed; only the user's intent is unfulfilled. The key path is
+// reported alongside the line because the line alone does not reveal that the
+// key was captured by the table above it, which is the actual mistake.
+func (l *loadState) warnMisfiled(ref ir.SourceRef, m misfiledDirective) {
+	if l.opts.Logger == nil {
+		return
+	}
+	l.opts.Logger.Warn().
+		Str("path", ref.Path).
+		Int("line", m.Line).
+		Str("key", m.Key).
+		Msg("include key belongs to a table and has no effect; " +
+			"move it above the first [table] header so it applies to the document root")
+}
+
 // withDefaults returns a copy with unset limits filled in.
 func (o LoadOptions) withDefaults() LoadOptions {
 	if o.MaxDepth <= 0 {
@@ -215,6 +234,10 @@ func (l *loadState) walk(resolvedPath string, declared ir.Format, chain []ir.Sou
 	d, err := parseDirectives(file)
 	if err != nil {
 		return prependChain(err, chain)
+	}
+
+	for _, m := range d.Misfiled {
+		l.warnMisfiled(file.Ref, m)
 	}
 
 	// Mark in-flight before descending so that a self-include is caught.

@@ -62,6 +62,31 @@ type directives struct {
 	// file. They are applied to the expansion result rather than to the
 	// includes themselves (AGENTS.md 21.2).
 	Excludes []string
+
+	// Misfiled records include/exclude keys that landed inside a table
+	// instead of at document root. They are reported as warnings, not errors.
+	Misfiled []misfiledDirective
+}
+
+// misfiledDirective is one include/exclude key found below the document root.
+//
+// In TOML a bare key written after a [table] header belongs to that table, so
+//
+//	[log]
+//	level = "info"
+//	include = ["extra.toml"]
+//
+// declares log.include, not include. The document still parses and the load
+// still succeeds, which is precisely the problem: the user believes the
+// fragment is included and nothing indicates otherwise. This type carries
+// enough detail to say exactly where the mistake is.
+type misfiledDirective struct {
+	// Key is the full dotted path, such as "log.include". It is what the user
+	// must search for, and it is not recoverable from the line alone.
+	Key string
+
+	// Line is the 1-based line the key was written on.
+	Line int
 }
 
 // parseDirectives extracts include and exclude instructions from a file.
@@ -124,7 +149,39 @@ func parseTOMLDirectives(f *ir.File) (directives, error) {
 		}
 		d.Includes = append(d.Includes, inc)
 	}
+
+	d.Misfiled = findMisfiledDirectives(string(f.Content), md)
 	return d, nil
+}
+
+// findMisfiledDirectives reports include/exclude keys declared below the
+// document root.
+//
+// The parsed key list is walked rather than the source text, because the key
+// list is the authoritative account of where TOML actually filed each key. A
+// text scan would have to reimplement TOML's table rules and would disagree
+// with the parser exactly where it matters.
+func findMisfiledDirectives(content string, md toml.MetaData) []misfiledDirective {
+	var out []misfiledDirective
+	lines := newLineScanner(content)
+
+	for _, key := range md.Keys() {
+		if len(key) < 2 {
+			// len == 1 is the document root, which is the correct place.
+			continue
+		}
+		last := key[len(key)-1]
+		if last != "include" && last != "exclude" {
+			continue
+		}
+
+		joined := strings.Join(key, ".")
+		out = append(out, misfiledDirective{
+			Key:  joined,
+			Line: lines.nextLineOf(joined),
+		})
+	}
+	return out
 }
 
 // lineScanner locates successive include directives in TOML source text.
@@ -168,6 +225,49 @@ func (s *lineScanner) nextIncludeLine() int {
 	line := s.found[s.next]
 	s.next++
 	return line
+}
+
+// nextLineOf returns the line where a dotted key path is written.
+//
+// The search tracks the current table header so that "log.include" is matched
+// under [log] and not under an unrelated table. It returns zero when the key
+// cannot be located, which leaves the warning usable even if the source has
+// been reformatted in a way this scan does not anticipate.
+func (s *lineScanner) nextLineOf(dotted string) int {
+	last := dotted
+	if i := strings.LastIndexByte(dotted, '.'); i >= 0 {
+		last = dotted[i+1:]
+	}
+
+	var table string
+	for i, raw := range s.lines {
+		line := strings.TrimSpace(stripTOMLComment(raw))
+
+		if strings.HasPrefix(line, "[") {
+			table = strings.Trim(line, "[]")
+			continue
+		}
+
+		if !strings.HasPrefix(line, last) {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(line, last))
+		if !strings.HasPrefix(rest, "=") {
+			continue
+		}
+
+		// A key under [log] is written as log.include; one at the root has an
+		// empty table prefix. Matching both parts is what keeps a nested key
+		// from being reported at a top-level key of the same name.
+		want := last
+		if table != "" {
+			want = table + "." + last
+		}
+		if want == dotted {
+			return i + 1
+		}
+	}
+	return 0
 }
 
 // stripTOMLComment removes a trailing comment from a line.

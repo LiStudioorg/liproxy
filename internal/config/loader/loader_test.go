@@ -551,3 +551,110 @@ func TestLoadWithoutLoggerDoesNotPanic(t *testing.T) {
 		t.Fatalf("Load with a nil logger: %v", err)
 	}
 }
+
+// TestLoadMisfiledIncludeWarns verifies the diagnostic for an include key that
+// TOML filed inside a table.
+//
+// The load must still succeed — the document is valid TOML — but the user has
+// to be told, because the alternative is a silently unapplied fragment, which
+// is the failure mode this warning exists to eliminate.
+func TestLoadMisfiledIncludeWarns(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "toml.d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "toml.d", "extra.toml"), []byte("mode = \"client\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The include sits below [log], so TOML reads it as log.include.
+	main := filepath.Join(dir, "liproxy.toml")
+	if err := os.WriteFile(main, []byte(`
+[log]
+level = "info"
+include = ["toml.d/*.toml"]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf)
+
+	set, err := Load(main, LoadOptions{Logger: &logger})
+	if err != nil {
+		t.Fatalf("a misfiled include must not fail the load: %v", err)
+	}
+	if len(set.Files) != 1 {
+		t.Fatalf("files = %d, want 1 (the fragment is not included)", len(set.Files))
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "log.include") {
+		t.Fatalf("warning does not name the misfiled key; got %q", out)
+	}
+	if !strings.Contains(out, "liproxy.toml") {
+		t.Errorf("warning does not name the file; got %q", out)
+	}
+	// The include key is on line 4 of the fixture above, counting the leading
+	// blank line.
+	if !strings.Contains(out, `"line":4`) {
+		t.Errorf("warning does not carry the line number; got %q", out)
+	}
+}
+
+// TestLoadMisfiledExcludeWarns verifies the same for a misfiled exclude.
+func TestLoadMisfiledExcludeWarns(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "liproxy.toml")
+	if err := os.WriteFile(main, []byte(`
+[dns]
+enabled = true
+exclude = ["x/*"]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf)
+	if _, err := Load(main, LoadOptions{Logger: &logger}); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "dns.exclude") {
+		t.Fatalf("no warning for a misfiled exclude; got %q", out)
+	}
+}
+
+// TestLoadCorrectIncludeDoesNotWarn verifies that the correctly placed include
+// produces no diagnostic, so the warning cannot become noise that users learn
+// to ignore.
+func TestLoadCorrectIncludeDoesNotWarn(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "toml.d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "toml.d", "extra.toml"), []byte("mode = \"client\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(dir, "liproxy.toml")
+	if err := os.WriteFile(main, []byte(`
+include = ["toml.d/*.toml"]
+
+[log]
+level = "info"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf)
+
+	set, err := Load(main, LoadOptions{Logger: &logger})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(set.Files) != 2 {
+		t.Fatalf("files = %d, want 2", len(set.Files))
+	}
+	if out := buf.String(); strings.Contains(out, "belongs to a table") {
+		t.Fatalf("a correctly placed include produced a warning: %q", out)
+	}
+}
