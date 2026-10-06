@@ -114,14 +114,14 @@ func runContext(parent context.Context, args []string, stdout, stderr *os.File) 
 		return 0
 	}
 
-	return serve(parent, cfg, logger, stderr)
+	return serve(parent, resolved, cfg, logger, stderr)
 }
 
 // serve runs the engine until a signal arrives.
 //
 // The signal context is created here rather than in run so that a test can
 // drive run to completion without signalling the whole test process.
-func serve(parent context.Context, cfg *ir.Config, logger *zerolog.Logger, stderr *os.File) int {
+func serve(parent context.Context, configPath string, cfg *ir.Config, logger *zerolog.Logger, stderr *os.File) int {
 	eng, err := engine.New(cfg, engine.Options{Logger: logger})
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to build the engine")
@@ -131,6 +131,24 @@ func serve(parent context.Context, cfg *ir.Config, logger *zerolog.Logger, stder
 	ctx, stop := signalContext(parent)
 	defer stop()
 
+	// Reloading re-runs the whole load and compile path rather than patching
+	// the running engine. That is what keeps the file the only source of
+	// truth: a reload can only produce a state that a restart from the same
+	// files would also produce.
+	if w, err := newWatcher(configPath, logger, func() error {
+		return reload(eng, configPath, logger)
+	}); err != nil {
+		// Watching is a convenience, not a requirement. The configuration
+		// already loaded is valid and the proxy works without it, so a
+		// failure here is reported and the service still starts.
+		logger.Warn().Err(err).Msg("cannot watch the configuration; edits will need a restart")
+	} else if w != nil {
+		// Run owns the watcher and closes it when the context ends, so
+		// shutdown order is the engine's context, not a separate deferred
+		// close that could race with an in-flight reload.
+		go w.Run(ctx)
+	}
+
 	logger.Info().Msg("starting")
 	if err := eng.Start(ctx); err != nil {
 		logger.Error().Err(err).Msg("engine stopped with an error")
@@ -138,6 +156,24 @@ func serve(parent context.Context, cfg *ir.Config, logger *zerolog.Logger, stder
 	}
 	logger.Info().Msg("stopped")
 	return 0
+}
+
+// reload re-reads the configuration from disk and installs it in the engine.
+//
+// The full path is re-run, not a partial patch, because the merge result
+// depends on every file: a change to one fragment can alter what another
+// contributes. Compiling the whole file set is the only way the running
+// configuration is guaranteed to match what a restart would produce.
+func reload(eng *engine.Engine, path string, logger *zerolog.Logger) error {
+	set, err := loader.Load(path, loader.LoadOptions{Logger: logger})
+	if err != nil {
+		return err
+	}
+	cfg, err := compile.FromFileSet(set)
+	if err != nil {
+		return err
+	}
+	return eng.Reload(cfg)
 }
 
 // checkConfig is retained for callers that only need the file probe.

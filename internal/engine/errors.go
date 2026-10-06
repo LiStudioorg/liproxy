@@ -3,7 +3,11 @@
 
 package engine
 
-import "github.com/LiStudioorg/liproxy/internal/outbound/outbounderr"
+import (
+	"errors"
+
+	"github.com/LiStudioorg/liproxy/internal/outbound/outbounderr"
+)
 
 // ErrBlocked re-exports the shared refusal sentinel.
 //
@@ -13,3 +17,11 @@ import "github.com/LiStudioorg/liproxy/internal/outbound/outbounderr"
 // match what an outbound actually returned — the check would compile and
 // silently never fire.
 var ErrBlocked = outbounderr.ErrBlocked
+
+// ErrInboundChangeRequiresRestart reports a reload that would have to replace a
+// listener.
+//
+// It is a distinct error rather than a generic failure because the operator's
+// next action is different: nothing about the configuration is wrong, and the
+// change takes effect on restart.
+var ErrInboundChangeRequiresRestart = errors.New("engine: changing inbounds requires a restart")

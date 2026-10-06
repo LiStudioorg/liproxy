@@ -32,12 +32,27 @@ func (e *Engine) Handle(ctx context.Context, client net.Conn, meta metadata.Meta
 		return err
 	}
 
-	tag, err := e.router.Route(meta)
+	// The generation is read once, with a reference taken in the same critical
+	// section. Everything below — routing, the outbound lookup, the dial and
+	// the relay — runs against this one generation, so a reload landing
+	// midway cannot route with one configuration and dial with another.
+	//
+	// Holding the reference for the whole connection is also what keeps a
+	// reload from closing the outbounds underneath it: the retired generation
+	// is only closed once the last connection using it has finished.
+	st := e.slot.load()
+	defer func() {
+		if retired := e.slot.release(st); retired != nil {
+			retired.retire(*e.logger)
+		}
+	}()
+
+	tag, err := st.router.Route(meta)
 	if err != nil {
 		return err
 	}
 
-	_, remote, err := e.dialOutbound(ctx, tag, meta)
+	_, remote, err := e.dialOutbound(ctx, st, tag, meta)
 	if err != nil {
 		// A refusal by policy is not a failure of this process. It is logged
 		// at debug so that blocking a rule does not look like a broken proxy,

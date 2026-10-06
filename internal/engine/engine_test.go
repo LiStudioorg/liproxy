@@ -459,33 +459,6 @@ func TestStartTwiceIsRejected(t *testing.T) {
 	}
 }
 
-// TestReloadIsNotSilentlyIgnored verifies that Reload reports that it is
-// unimplemented.
-//
-// A silent success would leave an operator believing a configuration change
-// took effect when nothing happened, which is worse than a clear refusal.
-func TestReloadIsNotSilentlyIgnored(t *testing.T) {
-	proxyPort := freePort(t)
-	entry := writeConfig(t, proxyPort, 0)
-
-	set, err := loader.Load(entry, loader.LoadOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := compile.FromFileSet(set)
-	if err != nil {
-		t.Fatal(err)
-	}
-	eng, err := engine.New(cfg, engine.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := eng.Reload(cfg); err == nil {
-		t.Fatal("Reload reported success; it is not implemented")
-	}
-}
-
 // TestNewRejectsUnknownProtocol verifies that a configuration naming a
 // protocol this build does not include fails at construction.
 func TestNewRejectsUnknownProtocol(t *testing.T) {

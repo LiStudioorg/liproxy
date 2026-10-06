@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,18 +39,26 @@ type Options struct {
 // defaultShutdownTimeout bounds shutdown when none is configured.
 const defaultShutdownTimeout = 5 * time.Second
 
+// logger is the subset of zerolog the engine uses, named so that the state
+// types can log without depending on the concrete logger type.
+type logger = zerolog.Logger
+
 // Engine is a running proxy service.
 type Engine struct {
-	cfg    *ir.Config
 	logger *zerolog.Logger
 	opts   Options
 
-	router *router.Router
+	// slot owns the current configuration generation and the reference count
+	// for every generation built so far.
+	//
+	// Routing and outbound lookup both go through it, which is what lets a
+	// reload replace the configuration while connections are in flight.
+	slot stateSlot
 
-	// inbounds and outbounds are built once in New and never mutated, so they
-	// can be read from any goroutine without a lock.
-	inbounds  []inbound.Inbound
-	outbounds map[string]outbound.Outbound
+	// inbounds are built once in New and never replaced, because a listener
+	// that is rebound loses its port and every connection queued on it. A
+	// configuration that would change them is refused by Reload.
+	inbounds []inbound.Inbound
 
 	mu      sync.Mutex
 	started bool
@@ -77,17 +86,9 @@ func New(cfg *ir.Config, opts Options) (*Engine, error) {
 		opts.ShutdownTimeout = defaultShutdownTimeout
 	}
 
-	rt, err := router.New(cfg)
-	if err != nil {
-		return nil, err
-	}
-
 	e := &Engine{
-		cfg:       cfg,
-		logger:    logger,
-		opts:      opts,
-		router:    rt,
-		outbounds: make(map[string]outbound.Outbound, len(cfg.Outbounds)),
+		logger: logger,
+		opts:   opts,
 	}
 
 	// Deps carries both capabilities: Handler for inbounds, which hand over
@@ -95,22 +96,19 @@ func New(cfg *ir.Config, opts Options) (*Engine, error) {
 	// outbound. The engine implements both, so the same value serves either.
 	deps := registry.Deps{Logger: logger, Router: e, Handler: e}
 
-	names := make([]string, 0, len(cfg.Outbounds))
-	for _, obCfg := range cfg.Outbounds {
-		ob, err := registry.NewOutbound(obCfg, deps)
-		if err != nil {
-			return nil, err
-		}
-		e.outbounds[obCfg.Tag] = ob
-		names = append(names, obCfg.Tag)
+	st, err := newState(cfg, deps)
+	if err != nil {
+		return nil, err
 	}
+	e.slot.current = st
 
 	for _, inCfg := range cfg.Inbounds {
 		in, err := registry.NewInbound(inCfg, deps)
 		if err != nil {
-			// Already-built outbounds are closed so that a failed
-			// construction does not leak whatever they acquired.
-			e.closeOutbounds()
+			// The state built above owns outbounds that would otherwise leak.
+			// It is retired through the normal path so that construction
+			// failure and a later reload clean up identically.
+			st.retire(*logger)
 			return nil, err
 		}
 		e.inbounds = append(e.inbounds, in)
@@ -119,10 +117,46 @@ func New(cfg *ir.Config, opts Options) (*Engine, error) {
 	logger.Info().
 		Int("inbounds", len(cfg.Inbounds)).
 		Int("outbounds", len(cfg.Outbounds)).
-		Int("rules", rt.Len()).
+		Int("rules", st.router.Len()).
 		Msg("engine constructed")
 
 	return e, nil
+}
+
+// newState builds one configuration generation.
+//
+// Every fallible step happens here, before anything is swapped: the router is
+// built and validated, then every outbound is instantiated. A generation that
+// cannot be built is therefore never installed, which is what makes a bad
+// reload leave the running configuration untouched rather than half-applied.
+func newState(cfg *ir.Config, deps registry.Deps) (*state, error) {
+	rt, err := router.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	st := &state{
+		cfg:       cfg,
+		router:    rt,
+		outbounds: make(map[string]outbound.Outbound, len(cfg.Outbounds)),
+		// The engine holds one reference for as long as this generation is
+		// installed, so a state can never be retired while it is current.
+		refs: 1,
+	}
+
+	for _, obCfg := range cfg.Outbounds {
+		ob, err := registry.NewOutbound(obCfg, deps)
+		if err != nil {
+			// Outbounds already built are closed here. Leaving them to the
+			// caller would mean every failed reload leaked whatever the
+			// successful ones had acquired.
+			st.retire(*deps.LoggerOr())
+			return nil, err
+		}
+		st.outbounds[obCfg.Tag] = ob
+	}
+
+	return st, nil
 }
 
 // Start runs every inbound until ctx is cancelled or one of them fails.
@@ -231,17 +265,16 @@ func (e *Engine) Close() error {
 			firstErr = err
 		}
 	}
-	e.closeOutbounds()
-	return firstErr
-}
 
-// closeOutbounds closes every outbound, reporting the first failure.
-func (e *Engine) closeOutbounds() {
-	for tag, ob := range e.outbounds {
-		if err := ob.Close(); err != nil {
-			e.logger.Warn().Err(err).Str("outbound", tag).Msg("closing outbound failed")
-		}
+	// Releasing the engine's own reference retires the installed generation if
+	// no connection is still using it. A generation that is still in use is
+	// closed by whichever connection releases it last, so shutdown neither
+	// waits indefinitely for in-flight traffic nor closes outbounds that are
+	// still carrying it.
+	if st := e.slot.release(e.slot.snapshot()); st != nil {
+		st.retire(*e.logger)
 	}
+	return firstErr
 }
 
 // Route returns the outbound tag that should serve a connection.
@@ -249,7 +282,7 @@ func (e *Engine) closeOutbounds() {
 // The engine implements the registry's routing capability so that a protocol
 // factory can be given one without importing this package.
 func (e *Engine) Route(meta metadata.Metadata) (string, error) {
-	return e.router.Route(meta)
+	return e.slot.snapshot().router.Route(meta)
 }
 
 // Inbounds returns the built inbounds, for diagnostics and tests.
@@ -260,28 +293,133 @@ func (e *Engine) Inbounds() []inbound.Inbound { return e.inbounds }
 // It exists for diagnostics. The connection path resolves outbounds through
 // the same map, so a tag that is absent here is absent there too.
 func (e *Engine) Outbound(tag string) (outbound.Outbound, bool) {
-	ob, ok := e.outbounds[tag]
+	ob, ok := e.slot.snapshot().outbounds[tag]
 	return ob, ok
 }
 
-// Reload replaces the configuration.
+// Config returns the configuration currently in effect.
 //
-// It is a stub. Hot reload needs the old connections to be drained while the
-// new configuration is already accepting, and doing it before the connection
-// lifecycle is settled would produce a reload that drops traffic in ways that
-// look like protocol bugs. Until then it reports that it is not implemented
-// rather than pretending to succeed — a silent no-op would leave the operator
-// believing a change took effect.
+// It is the installed generation, not the one last passed to Reload, so a
+// caller reading it after a failed reload sees what is actually running.
+func (e *Engine) Config() *ir.Config {
+	return e.slot.snapshot().cfg
+}
+
+// Reload replaces the configuration without dropping traffic.
+//
+// The sequence is: build a complete new generation, refuse if the inbounds
+// would have to change, then swap it in. Every failure happens before the
+// swap, so a rejected reload leaves the running configuration exactly as it
+// was — a bad edit never takes the service down, which is the whole reason the
+// configuration file can be treated as the source of truth.
+//
+// Existing connections keep using the generation they started on and are not
+// interrupted: a reload is a configuration change, not a reason to cut off
+// someone's download. Their outbounds stay open until the last of them
+// finishes, at which point the retired generation is closed.
 func (e *Engine) Reload(cfg *ir.Config) error {
-	return errors.New("engine: reload is not implemented yet")
+	if cfg == nil {
+		return errors.New("engine: nil configuration")
+	}
+
+	e.mu.Lock()
+	closed := e.closed
+	e.mu.Unlock()
+	if closed {
+		return errors.New("engine: Reload called on a closed engine")
+	}
+
+	// Inbounds cannot be replaced in place. A listener that is rebound loses
+	// its port, and anything queued on the old one is dropped, so a reload
+	// that changed the listening set would fail for reasons the operator
+	// cannot see. Refusing is honest and the fix is a restart.
+	if err := e.checkInboundsUnchanged(cfg); err != nil {
+		return err
+	}
+
+	deps := registry.Deps{Logger: e.logger, Router: e, Handler: e}
+
+	// Built before the swap, so a configuration naming a missing protocol or
+	// an unsupported rule type fails here with the old one still serving.
+	next, err := newState(cfg, deps)
+	if err != nil {
+		return err
+	}
+
+	retired := e.slot.swap(next)
+	if retired != nil {
+		// Nothing was using the previous generation, which is the common case
+		// for a reload between connections.
+		retired.retire(*e.logger)
+	}
+
+	e.logger.Info().
+		Int("outbounds", len(cfg.Outbounds)).
+		Int("rules", next.router.Len()).
+		Bool("draining", retired == nil).
+		Msg("configuration reloaded")
+
+	return nil
+}
+
+// checkInboundsUnchanged refuses a reload whose inbound list differs from the
+// running one.
+func (e *Engine) checkInboundsUnchanged(cfg *ir.Config) error {
+	current := e.slot.snapshot().cfg
+	if inboundSetsEqual(current.Inbounds, cfg.Inbounds) {
+		return nil
+	}
+	return fmt.Errorf("%w: the running engine listens on %s but the new configuration asks for %s",
+		ErrInboundChangeRequiresRestart, describeInbounds(current.Inbounds), describeInbounds(cfg.Inbounds))
+}
+
+// inboundSetsEqual reports whether two inbound lists describe the same
+// listeners.
+//
+// The comparison is over the fields that determine what is listened on, not
+// over the whole struct. Option maps are deliberately excluded: a changed
+// header timeout does not require rebinding, and treating it as one would
+// force a restart for something the running listener could adopt. Fields are
+// compared positionally, because the order of the list is what the loader and
+// merger preserve and a reordering is worth reporting rather than silently
+// matching.
+func inboundSetsEqual(a, b []ir.Inbound) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Tag != b[i].Tag ||
+			a[i].Type != b[i].Type ||
+			a[i].Listen != b[i].Listen ||
+			a[i].Port != b[i].Port {
+			return false
+		}
+	}
+	return true
+}
+
+// describeInbounds renders a listener list for an error message.
+func describeInbounds(list []ir.Inbound) string {
+	if len(list) == 0 {
+		return "nothing"
+	}
+	out := make([]string, 0, len(list))
+	for _, in := range list {
+		listen := in.Listen
+		if listen == "" {
+			listen = "0.0.0.0"
+		}
+		out = append(out, fmt.Sprintf("%s (%s on %s:%d)", in.Tag, in.Type, listen, in.Port))
+	}
+	return strings.Join(out, ", ")
 }
 
 // dialOutbound resolves a tag and opens a connection through that outbound.
 //
 // It is the single place where a tag becomes a live connection, so the error
 // for an unknown tag and the error for a failed dial are both produced once.
-func (e *Engine) dialOutbound(ctx context.Context, tag string, meta metadata.Metadata) (outbound.Outbound, net.Conn, error) {
-	ob, ok := e.outbounds[tag]
+func (e *Engine) dialOutbound(ctx context.Context, st *state, tag string, meta metadata.Metadata) (outbound.Outbound, net.Conn, error) {
+	ob, ok := st.outbounds[tag]
 	if !ok {
 		return nil, nil, fmt.Errorf("engine: rule selected outbound %q, which is not defined", tag)
 	}
