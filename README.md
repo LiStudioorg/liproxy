@@ -480,6 +480,8 @@ lip import clash config.yaml --dry-run
 └── backups/         # 自动备份
 ```
 
+`state/` 与 `backups/` 由运行时按需创建，首次启动前不存在。
+
 | 路径 | 是否可手改 | 说明 |
 | --- | --- | --- |
 | `liproxy.toml` / `liproxy.yaml` | ✅ | **权威源**。改完自动热重载 |
