@@ -33,9 +33,7 @@ import (
 	// live here rather than in the engine so that building a reduced binary is
 	// a matter of removing a line from this file. The engine, router and relay
 	// must never import a protocol package (AGENTS.md 16, pitfall 2).
-	_ "github.com/LiStudioorg/liproxy/internal/inbound/http"
-	_ "github.com/LiStudioorg/liproxy/internal/outbound/block"
-	_ "github.com/LiStudioorg/liproxy/internal/outbound/direct"
+	_ "github.com/LiStudioorg/liproxy/internal/registry/all"
 )
 
 // defaultConfigPath is where lipd looks for liproxy.toml when --config is
