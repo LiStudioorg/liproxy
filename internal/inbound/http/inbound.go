@@ -35,6 +35,30 @@ type Handler interface {
 	Handle(ctx context.Context, client net.Conn, meta metadata.Metadata) error
 }
 
+// sniffingHandler is implemented by a handler that recovers a destination name
+// from the connection before routing.
+//
+// It is a separate optional interface rather than part of Handler because
+// sniffing is an engine capability, not something an inbound should have to
+// implement or even know about. An inbound reports what it parsed; whether the
+// stream is examined further is the engine's decision, and it depends on
+// configuration the inbound cannot see.
+//
+// The handler swaps the connection it returns, and that swap is the point:
+// sniffing reads from the stream, and the bytes it read are buffered in the
+// connection it hands back.
+type sniffingHandler interface {
+	HandleAndSniff(ctx context.Context, client net.Conn, meta metadata.Metadata) error
+}
+
+// serve hands a connection to the handler, sniffing first when it can.
+func (in *Inbound) serve(ctx context.Context, client net.Conn, meta metadata.Metadata) error {
+	if sh, ok := in.handler.(sniffingHandler); ok {
+		return sh.HandleAndSniff(ctx, client, meta)
+	}
+	return in.handler.Handle(ctx, client, meta)
+}
+
 // Inbound is an HTTP proxy listener.
 type Inbound struct {
 	tag     string

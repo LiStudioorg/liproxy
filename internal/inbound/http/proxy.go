@@ -6,7 +6,6 @@ package http
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -148,7 +147,7 @@ func (in *Inbound) serveConnect(w http.ResponseWriter, r *http.Request) {
 		client = &prefixConn{Conn: client, prefix: prefix}
 	}
 
-	if err := in.handler.Handle(r.Context(), client, meta); err != nil {
+	if err := in.serve(r.Context(), client, meta); err != nil {
 		in.log().Debug().Err(err).Str("inbound", in.tag).Str("target", target).
 			Msg("tunnel closed with error")
 	}
@@ -194,64 +193,65 @@ func (in *Inbound) serveForward(w http.ResponseWriter, r *http.Request) {
 		meta.DestAddr = &net.TCPAddr{Port: port}
 	}
 
-	// The request is replayed over the dialed connection by the engine, so
-	// what this package hands over is the serialized request head followed by
-	// any body. r.Write does exactly that and is the standard library's own
-	// serializer, which keeps request framing out of this package.
-	var head bytes.Buffer
-	if err := r.Write(&head); err != nil {
-		http.Error(w, "cannot serialize request: "+err.Error(), http.StatusInternalServerError)
+	// The connection is hijacked rather than written through, because the
+	// response must be relayed byte for byte. Writing through the
+	// ResponseWriter would let net/http prepend its own status line and
+	// headers to the first bytes of the proxied response: the client would
+	// receive two response heads, and the boundary between them is not
+	// something a proxy can know. Hijacking hands over the raw stream, which
+	// is the same thing the CONNECT path does.
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "connection hijacking is not supported", http.StatusInternalServerError)
+		return
+	}
+	client, rw, err := hijacker.Hijack()
+	if err != nil {
+		in.log().Debug().Err(err).Str("inbound", in.tag).Msg("hijack failed")
 		return
 	}
 
-	client := &responseConn{
-		Conn:   nopConn{},
-		source: bytes.NewReader(head.Bytes()),
-		writer: w,
+	// net/http has already consumed the request head from the socket, so the
+	// engine would see only the body. The head is re-serialized and prepended,
+	// which reconstructs the stream the destination expects.
+	//
+	// r.Write is the standard library's own serializer, so request framing
+	// stays out of this package. The URL is rewritten to origin form first:
+	// the client sent absolute form because it was addressing a proxy, and an
+	// origin server expects the path.
+	out := r.Clone(r.Context())
+	out.URL.Scheme = ""
+	out.URL.Host = ""
+	out.RequestURI = ""
+
+	var prefix bytes.Buffer
+	if err := out.Write(&prefix); err != nil {
+		_ = client.Close()
+		in.log().Debug().Err(err).Str("inbound", in.tag).Msg("cannot serialize the request")
+		return
 	}
 
-	if err := in.handler.Handle(r.Context(), client, meta); err != nil {
+	// Any request body bytes sitting in the buffered reader follow the head;
+	// net/http reads ahead, so they are no longer on the socket.
+	if buffered := rw.Reader.Buffered(); buffered > 0 {
+		rest := make([]byte, buffered)
+		if _, err := readFull(rw, rest); err != nil {
+			_ = client.Close()
+			return
+		}
+		prefix.Write(rest)
+	}
+
+	// The head is written from the prefix while responses go to the socket, so
+	// the connection is one stream to the engine and a real client on the
+	// other side. Only the read side is redirected.
+	conn := &prefixConn{Conn: client, prefix: prefix.Bytes()}
+
+	if err := in.serve(r.Context(), conn, meta); err != nil {
 		in.log().Debug().Err(err).Str("inbound", in.tag).Str("url", r.URL.String()).
 			Msg("forward request failed")
 	}
-}
-
-// nopConn is a net.Conn with no kernel socket behind it.
-//
-// A forwarded request has no hijacked connection: the client is still attached
-// to the http.ResponseWriter. It exists so that the engine receives one type
-// of stream for both tunnel and forward cases, rather than branching on which
-// kind of request produced it.
-type nopConn struct{}
-
-func (nopConn) Read([]byte) (int, error)         { return 0, io.EOF }
-func (nopConn) Write(b []byte) (int, error)      { return len(b), nil }
-func (nopConn) Close() error                     { return nil }
-func (nopConn) LocalAddr() net.Addr              { return stringAddr("") }
-func (nopConn) RemoteAddr() net.Addr             { return stringAddr("") }
-func (nopConn) SetDeadline(time.Time) error      { return nil }
-func (nopConn) SetReadDeadline(time.Time) error  { return nil }
-func (nopConn) SetWriteDeadline(time.Time) error { return nil }
-
-// responseConn feeds a serialized request to the engine and writes the reply
-// back through the ResponseWriter.
-type responseConn struct {
-	net.Conn
-	source *bytes.Reader
-	writer http.ResponseWriter
-}
-
-// Read serves the serialized request bytes.
-func (c *responseConn) Read(p []byte) (int, error) { return c.source.Read(p) }
-
-// Write sends bytes back to the client and flushes them immediately, since a
-// proxied response has no framing this package can rely on.
-func (c *responseConn) Write(p []byte) (int, error) {
-	n, err := c.writer.Write(p)
-	if f, ok := c.writer.(http.Flusher); ok {
-		f.Flush()
-	}
-	return n, err
+	_ = client.Close()
 }
 
 // splitHostPort splits a CONNECT target, supplying a default port.

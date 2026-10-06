@@ -135,6 +135,42 @@ func (f *probeFactory) setDial(fn func() net.Conn) {
 	f.dialFn = fn
 }
 
+// eventuallyClosed waits until an outbound reports itself closed.
+//
+// Closing is asynchronous: a connection releases its reference when Handle
+// returns, and the client returning from a read says nothing about whether
+// that has happened yet. Asserting immediately makes the test pass or fail on
+// goroutine scheduling, so it waits for the state instead.
+func eventuallyClosed(t *testing.T, p *probeOutbound, what string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.isClosed() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s was never closed", what)
+}
+
+// eventuallyDialed waits until an outbound has been dialed n times.
+//
+// The proxy answers CONNECT before it dials: the 200 tells the client the
+// tunnel exists, and the destination is chosen afterwards. A test that reads
+// the dial count as soon as the client sees that response is therefore racing
+// the engine, and would pass or fail on scheduling rather than on behaviour.
+func eventuallyDialed(t *testing.T, p *probeOutbound, n int, what string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.dialCount() >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s was dialed %d times, want %d", what, p.dialCount(), n)
+}
+
 // latest returns the most recently created instance.
 //
 // A reload builds a new instance of every outbound, so an assertion about what
@@ -336,9 +372,7 @@ func TestReloadChangesRouting(t *testing.T) {
 	if err := exchange(); err != nil {
 		t.Fatalf("first request: %v", err)
 	}
-	if got := probeA.latest(t).dialCount(); got != 1 {
-		t.Fatalf("before reload the primary outbound was dialed %d times, want 1", got)
-	}
+	eventuallyDialed(t, probeA.latest(t), 1, "the primary outbound before the reload")
 
 	// Swap the final rule to the other outbound and reload.
 	cfg2 := loadConfig(t, path)
@@ -353,20 +387,14 @@ func TestReloadChangesRouting(t *testing.T) {
 	if err := exchange(); err != nil {
 		t.Fatalf("request after reload: %v", err)
 	}
-	if got := probeB.latest(t).dialCount(); got != 1 {
-		t.Fatalf("after reload the fallback outbound was dialed %d times, want 1", got)
-	}
+	eventuallyDialed(t, probeB.latest(t), 1, "the fallback outbound after the reload")
 	// The retired generation's instance is the first one; it must not have
 	// been used again, and it must have been closed.
 	if got := probeA.instances()[0].dialCount(); got != 1 {
 		t.Errorf("the retired primary outbound was dialed again after the reload (%d times)", got)
 	}
-	if !probeA.instances()[0].isClosed() {
-		t.Error("the retired primary outbound was not closed")
-	}
-	if !probeB.instances()[0].isClosed() {
-		t.Error("the retired fallback outbound was not closed")
-	}
+	eventuallyClosed(t, probeA.instances()[0], "the retired primary outbound")
+	eventuallyClosed(t, probeB.instances()[0], "the retired fallback outbound")
 }
 
 // TestFailedReloadLeavesRunningConfigIntact verifies that a rejected reload
@@ -440,9 +468,7 @@ func TestFailedReloadLeavesRunningConfigIntact(t *testing.T) {
 	if !strings.Contains(string(buf[:n]), "200") {
 		t.Fatalf("response after a failed reload = %q", buf[:n])
 	}
-	if got := probe.latest(t).dialCount(); got != 1 {
-		t.Errorf("the surviving outbound was dialed %d times, want 1", got)
-	}
+	eventuallyDialed(t, probe.latest(t), 1, "the surviving outbound")
 }
 
 // TestReloadRejectsInboundChange verifies that a reload which would need to
@@ -542,16 +568,7 @@ func TestRetiredOutboundClosedAfterLastConnection(t *testing.T) {
 	// Wait until the dial has definitely happened, so the connection holds a
 	// reference before the reload.
 	old := probe.latest(t)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if old.dialCount() == 1 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if old.dialCount() != 1 {
-		t.Fatal("the connection was never dialed")
-	}
+	eventuallyDialed(t, old, 1, "the outbound holding the connection open")
 
 	// Reload while that connection is still open.
 	cfg2 := loadConfig(t, path)
@@ -570,14 +587,7 @@ func TestRetiredOutboundClosedAfterLastConnection(t *testing.T) {
 	_ = client.Close()
 	_ = clientSide.Close()
 
-	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if old.isClosed() {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("the retired outbound was never closed after its last connection ended")
+	eventuallyClosed(t, old, "the retired outbound after its last connection ended")
 }
 
 // TestReloadWithNoConnectionsClosesImmediately verifies the other half of the
@@ -747,8 +757,9 @@ func TestReloadPreservesExistingConnection(t *testing.T) {
 	serverSide, clientSide := net.Pipe()
 	defer serverSide.Close()
 
-	// Only the type name matters here; the instances are not inspected.
-	_, typ := registerProbe(t, func() net.Conn { return clientSide })
+	// The probe is captured so the test can wait for the dial, which is what
+	// establishes that the relay is actually running on this connection.
+	probe, typ := registerProbe(t, func() net.Conn { return clientSide })
 
 	proxyPort := freePort(t)
 	path := writeReloadableConfig(t, typ, "direct", proxyPort)
@@ -778,6 +789,12 @@ func TestReloadPreservesExistingConnection(t *testing.T) {
 	if _, err := client.Read(buf); err != nil {
 		t.Fatalf("reading the CONNECT response: %v", err)
 	}
+
+	// The 200 is sent before the dial, so the tunnel is not yet carrying
+	// anything when the client sees it. Waiting for the dial is what makes the
+	// reload below land on a connection that is genuinely in flight, which is
+	// the whole point of the test.
+	eventuallyDialed(t, probe.latest(t), 1, "the outbound for the established connection")
 
 	// Reload, then use the established tunnel. The bytes travel over the
 	// pinned connection from before the swap.

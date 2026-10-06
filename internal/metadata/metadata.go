@@ -45,6 +45,15 @@ type Metadata struct {
 	// InboundTag identifies the inbound that accepted the connection, so that
 	// rules and logs can distinguish traffic arriving on different listeners.
 	InboundTag string
+
+	// Protocol records how Domain was recovered, when sniffing supplied it:
+	// "tls" for a ClientHello SNI, "http" for a Host header.
+	//
+	// It is empty when the name came from the protocol itself or when there is
+	// no name at all. It exists for diagnostics — "the rule did not fire" is
+	// answered differently when the name was never recovered than when it was
+	// recovered from the wrong layer.
+	Protocol string
 }
 
 // Destination returns the host:port an outbound should dial.
