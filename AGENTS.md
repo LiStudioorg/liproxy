@@ -14,8 +14,8 @@ LiProxy 是一个用 Go 1.22+ 编写的、Web 驱动的全能代理平台。它�
 
 **关键定位（三句话）：**
 
-1. **配置文件是权威源（Source of Truth）** —— 业务配置写在 `~/.li/liproxy/` 下的主配置与 `toml.d/` `yaml.d/` 片段里，冲突时以合并结果为准，数据库里没有第二份业务配置。
-2. **Web 是观察者与运行时调节器** —— Web 只读当前生效的 IR、连接、流量与日志，唯一的写能力是 `state/overrides.toml` 里的运行时字段（切节点、临时规则、日志级别）。Web 永远不写主配置与片段目录。
+1. **配置文件是唯一权威源（Source of Truth）** —— 业务配置写在 `~/.li/liproxy/` 下的主配置与 `toml.d/` `yaml.d/` 片段里，冲突时以合并结果为准，数据库里没有第二份业务配置。**Web 可直接读写这些配置文件，但必须经过 IR 校验、原子写入、备份回滚三道关。**
+2. **Web 是配置编辑器与观察台** —— Web 既能编辑配置文件（受校验、原子写入、备份回滚保护），也能观察当前生效的 IR、连接、流量与日志。Web 与手写文件是同一个权威源的两个入口，不存在第二份配置。
 3. **数据库降级为运行时状态** —— SQLite 只存会话、API Key、审计、流量日志、订阅缓存与运行时快照，且是**可选组件**：纯客户端模式不创建数据库也能跑。
 4. **IR 是唯一的内存表示** —— TOML 与 YAML 都只是前端解析器，解析后统一编译为 IR，核心引擎只认 IR，不认 TOML / YAML。
 
@@ -96,13 +96,14 @@ LiProxy 是一个用 Go 1.22+ 编写的、Web 驱动的全能代理平台。它�
    → engine 热重载 → 旧连接优雅关闭 → 新配置生效
 ```
 
-**数据流（一次运行时覆盖 —— Web 的唯一写路径）：**
+**数据流（一次 Web 配置变更）：**
 
 ```text
-Web 表单 → API handler → 校验字段属于运行时白名单
-        → 写入 state/overrides.toml（原子替换：临时文件 + rename）
-        → 走同一套加载与编译流程 → 热重载
-        → 若校验失败：回滚 overrides.toml，保留旧 IR，向前端返回错误
+Web 表单 → API handler → 校验字段 → 写入配置文件
+        → 备份到 backups/ → 临时文件 + rename 原子替换
+        → 走同一套加载与编译流程（IR 校验）
+        → 校验失败：回滚文件，保留旧 IR，向前端返回错误
+        → 校验通过：引擎热重载 → 新配置生效
 ```
 
 **数据流（一次连接）：**
@@ -173,9 +174,8 @@ liproxy/
 ├── yaml.d/               # YAML 片段，按文件名字典序加载
 ├── state/                # 运行时状态（非权威）
 │   ├── li.db             #   SQLite：会话 · API Key · 审计 · 流量 · 订阅缓存
-│   ├── overrides.toml    #   Web 写入的运行时覆盖（仅白名单字段）
 │   └── fakeip.db         #   Fake-IP 映射持久化
-└── backups/              # 自动备份（写 overrides 前先备份）
+└── backups/              # 自动备份（Web 写配置前先备份）
 ```
 
 > `state/` 与 `backups/` 里的一切都**不是权威源**：删掉它们，服务能重建；删掉主配置与 `*.d/`，服务就失去了业务配置。这条区分是排查问题的第一把尺子。
@@ -625,13 +625,18 @@ r.Route("/api/v1", func(r chi.Router) {
 | 接口类型 | 例子 | 实现方式 |
 | --- | --- | --- |
 | **只读配置** | `GET /api/v1/config`、`GET /api/v1/nodes`、`GET /api/v1/rules` | 只读当前 IR，**不碰文件** |
-| **写运行时覆盖** | `POST /api/v1/overrides`、`PATCH /api/v1/runtime/active-node` | 只写 `state/overrides.toml`，字段必须在白名单内 |
+| **写配置** | `PATCH /api/v1/config`、`PUT /api/v1/config/nodes/{tag}` | 经 IR 校验 → 备份 → 原子写入配置文件 |
 | **写运行时状态** | `POST /api/v1/auth/login`、`POST /api/v1/api-keys` | 写数据库（或内存，当数据库禁用时） |
 | **导出/导入** | `POST /api/v1/config/export`、`POST /api/v1/config/import` | 导出返回文本；导入**只返回合并预览**，落盘由用户自己做 |
 
-**禁止**出现任何直接写主配置、`toml.d/`、`yaml.d/` 的 API。发现了就是架构违规，不是"功能增强"。
+写配置的接口**必须**走统一的三步写入器（IR 校验 → 备份 → 原子替换），不允许自己 `os.WriteFile`。三步的顺序不可颠倒，失败要回滚，见第 21.6 节。
 
-覆盖白名单是硬编码的字段集合（如 `log.level`、`runtime.active_node`、`runtime.temp_rules`），实现上是一个显式的 map，新增字段必须同时改这里与文档。
+**写接口的硬性要求：**
+
+1. 写入前先用待写入内容编译一次 IR，校验不过直接拒绝，不落盘
+2. 落盘前把原文件复制到 `backups/`，备份失败则中止
+3. 用「临时文件 + `rename`」原子替换，避免读到半个文件
+4. 写入后重新加载；若因任何原因失败，用备份回滚并返回错误
 
 **第 7 步：错误映射**
 
@@ -891,8 +896,8 @@ Closes #210
 **2. 不要在 `engine` / `router` / `relay` 中 import 具体协议包。**
 协议只能通过 `registry` 创建。一旦核心引擎依赖具体协议，精简版构建（`build-minimal`）就会失效，且会出现循环依赖。
 
-**3. 不要让 Web 写配置文件。**
-Web 的唯一写路径是 `state/overrides.toml` 的运行时白名单字段。任何"顺手帮用户把改动写回 `liproxy.toml`"的实现，都会让 LiProxy 变成配置文件的第二个写入者，用户用 Git 管理配置时必然冲突。导出与导入预览是允许的，落盘必须由用户自己做。
+**3. 不要让 Web 绕过校验直接写配置文件。**
+Web 可以写配置文件，但**必须**走统一的三步写入器：先编译 IR 校验 → 备份原文件到 `backups/` → 临时文件加 `rename` 原子替换。任何直接 `os.WriteFile` 覆盖配置的实现都是违规的 —— 一次失败的写入会让配置文件处于半损坏状态，而用户可能正在用它。
 
 **4. 不要在热路径分配内存。**
 `relay` 的转发循环、`router` 的匹配函数、`sniffer` 的解析函数都会被调用百万次。任何 `fmt.Sprintf`、`json.Marshal`、临时切片都会直接反映到内存指标上。写之前先问：这段代码每连接执行几次？
@@ -945,8 +950,8 @@ include 环检测必须 `EvalSymlinks` 之后再比较规范化绝对路径，�
 **20. 不要让单个片段文件解析失败拖垮整份配置。**
 `toml.d/` 里某个文件语法写错时，正确行为是：报出**该文件与行号**，保留上一份可用 IR 继续运行，并在 Web 顶部显示降级告警。直接 panic、退出、或静默跳过该文件都是错的 —— 静默跳过会让用户以为配置已经生效。
 
-**21. 不要把 overrides 当成第二个配置源。**
-`state/overrides.toml` 只允许承载运行时白名单字段。一旦有人往里面塞节点、规则或 DNS 配置，"配置文件是唯一权威源"就不成立了，用户会陷入"我在 liproxy.toml 里改了但没生效"的困境。白名单是显式 map，加字段必须同时改代码与文档。
+**21. 不要在配置文件之外保存任何业务配置。**
+节点、规则、DNS、监听器只能存在于主配置与 `toml.d/` `yaml.d/` 片段里。数据库、内存态、任何"临时覆盖文件"都不允许成为第二个配置来源 —— 一旦有两处可写，用户就会陷入"我在 liproxy.toml 里改了但没生效"的困境。运行时确实需要变化的状态（如当前选中节点），存 `runtime_state` 表并由 Web 读取，不要回写成配置。
 
 ---
 
@@ -1005,7 +1010,7 @@ include 环检测必须 `EvalSymlinks` 之后再比较规范化绝对路径，�
 
 ## 18. License 规范
 
-**LiProxy 采用 [GNU Affero General Public License v3.0](../LICENSE)（AGPL-3.0）。**
+**LiProxy 采用 [GNU Affero General Public License v3.0](../LICENSE)（AGPL-3.0 only）。**
 
 AGPL-3.0 是强 copyleft 协议：任何人修改并通过网络提供服务，都必须向使用者提供完整源代码（第 13 条）。这直接约束了我们的开发方式 —— 引入任何新依赖前，必须先确认它的许可证与 AGPL-3.0 兼容。
 
@@ -1016,132 +1021,142 @@ AGPL-3.0 是强 copyleft 协议：任何人修改并通过网络提供服务，�
 | MIT / Apache-2.0 / BSD-2 / BSD-3 / ISC | ✅ | 宽松协议，与 AGPL-3.0 兼容 |
 | MPL-2.0 / LGPL-2.1 / LGPL-3.0 | ⚠️ | 可用，但需在 PR 中说明动态链接方式与合规理由 |
 | GPL-2.0 / GPL-3.0 | ✅ | 与 AGPL-3.0 兼容 |
-| AGPL-3.0 | ✅ | 同协议 |
+| AGPL-3.0-only | ✅ | 同协议 |
 | 专有 / 商业 / SSPL / BSL / Commons Clause | ❌ | **禁止引入**，会与 AGPL-3.0 冲突 |
 | 许可证缺失（无 LICENSE 文件） | ❌ | 默认保留全部权利，禁止引入 |
 
 新依赖必须在 PR 描述中列出名称、版本、许可证，并附上 `go-licenses` / `pnpm licenses list` 的核对结果。
 
-**每个源代码文件头部必须带 license header。** 没有例外：新文件、生成的代码模板、示例脚本都要带。CI 会校验（见下文）。
+### 18.1 为什么用 SPDX 而不是全文声明
 
-### Go 文件 header
+每个源文件头部只写**两行**：
+
+```text
+Copyright (C) 2026 LiStudioorg
+SPDX-License-Identifier: AGPL-3.0-only
+```
+
+理由：
+
+1. **机器可读** —— SPDX 是 Linux 基金会维护的标准化许可证标识符，`licensee`、`reuse`、GitHub、SCANCODE、FOSSA 等工具都能直接解析，不需要正则匹配自然语言
+2. **CI 可以直接 grep** —— 校验退化成一行精确匹配，不会因为换行、措辞微调而误判（见 18.3）
+3. **法律文件放一份就够** —— 完整条款在仓库根目录的 `LICENSE` 里，逐字保留、只此一份。在每个源文件里复制 15 行既增加噪音，又制造了"多份副本可能不同步"的风险
+4. **diff 干净** —— 头部只有 2 行，新增文件时不会因为 license 模板刷屏而淹没真正的改动
+
+> 这两行**不是**许可证的替代品，而是指向 `LICENSE` 的指针。文件里的 SPDX 标识与 `LICENSE` 全文共同构成完整的授权声明。
+
+### 18.2 各语言模板
+
+**统一规则：第一行版权，第二行 SPDX，第三行留空，之后才是包注释 / import / 代码。**
+
+#### Go
 
 ```go
-// LiProxy - a web-driven universal proxy platform.
-// Copyright (C) 2026 LiProxy Contributors
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// Copyright (C) 2026 LiStudioorg
+// SPDX-License-Identifier: AGPL-3.0-only
 
 package foo
 ```
 
-> 注意：header 必须放在 `//go:build` 约束**之后**、`package` 声明**之前**。文件顶部的 `//go:generate` 指令可以留在 header 前面。
+带 package 注释时：
 
-### TypeScript / Vue 文件 header
+```go
+// Copyright (C) 2026 LiStudioorg
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Package foo does something.
+package foo
+```
+
+> **位置要求**：header 必须位于 `//go:build` 约束**之后**、`package` 声明**之前**。没有 build tag 时它就是文件首行。
+
+#### TypeScript / Vue / JavaScript
 
 ```ts
-/**
- * LiProxy - a web-driven universal proxy platform.
- * Copyright (C) 2026 LiProxy Contributors
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
+// Copyright (C) 2026 LiStudioorg
+// SPDX-License-Identifier: AGPL-3.0-only
+
 ```
 
-`.vue` 文件把这段注释放在文件**第一行**（`<script setup>` 块之外），这样构建产物里也能看到版权声明。
+`.vue` 文件把这两行放在文件**第一行**（`<script setup>` 块之外）。
 
-### SQL 文件 header（含迁移）
+#### SQL（含迁移）
 
 ```sql
--- LiProxy - a web-driven universal proxy platform.
--- Copyright (C) 2026 LiProxy Contributors
---
--- This program is free software: you can redistribute it and/or modify
--- it under the terms of the GNU Affero General Public License as published by
--- the Free Software Foundation, either version 3 of the License, or
--- (at your option) any later version.
---
--- This program is distributed in the hope that it will be useful,
--- but WITHOUT ANY WARRANTY; without even the implied warranty of
--- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
--- GNU Affero General Public License for more details.
---
--- You should have received a copy of the GNU Affero General Public License
--- along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-- Copyright (C) 2026 LiStudioorg
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 ```
 
-> 迁移文件的 header 属于**已发布内容的一部分**：一旦迁移合入 `main`，header 就不可再修改（见第 11 节与第 16 节陷阱 6）。
+#### Shell / Makefile / YAML / TOML
 
-### Shell 脚本 header
+```sh
+# Copyright (C) 2026 LiStudioorg
+# SPDX-License-Identifier: AGPL-3.0-only
+
+```
+
+Shell 脚本里这两行放在 shebang **之后**：
 
 ```sh
 #!/usr/bin/env bash
-# LiProxy - a web-driven universal proxy platform.
-# Copyright (C) 2026 LiProxy Contributors
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+# Copyright (C) 2026 LiStudioorg
+# SPDX-License-Identifier: AGPL-3.0-only
+
 set -euo pipefail
 ```
 
-### 其他文件类型
+#### 不要求 header 的文件
 
-| 类型 | header 形式 |
-| --- | --- |
-| YAML / TOML | `#` 注释，同 Shell 格式 |
-| Makefile | `#` 注释，紧随 `.DEFAULT_GOAL` 之前 |
-| Markdown 文档 | 不需要 header；许可证信息集中在 README 的 License 章节 |
-| 生成物（`web/dist/`、`bin/`） | 不需要 header |
+- 自动生成的代码（如 `go generate` 产物、protobuf 生成文件）
+- `web/dist/` 下的构建产物
+- Markdown 文档、`LICENSE`、`.gitignore` 等非源代码文件
 
-### CI 检查
+### 18.3 CI 检查
 
-CI 在 lint 阶段运行 header 校验，缺失即阻断合并：
+CI 在 lint 阶段校验每一行都必须**精确**匹配，缺失或写错即阻断合并：
 
 ```bash
-# Go 文件（在 golangci-lint 之外单独校验，因为它按行匹配而不是按 AST）
-find . -name '*.go' -not -path './web/dist/*' -not -path './vendor/*' \
-  | xargs grep -L 'GNU Affero General Public License as published by' \
+# Go
+find . -name '*.go' -not -path './vendor/*' -not -path './web/dist/*' \
+  | xargs grep -L 'SPDX-License-Identifier: AGPL-3.0-only' | tee /dev/stderr | (! read)
+
+# 前端
+grep -rL 'SPDX-License-Identifier: AGPL-3.0-only' web/src --include='*.ts' --include='*.vue' \
   | tee /dev/stderr | (! read)
 
-# 前端与脚本
-pnpm exec license-header-check --template scripts/license-header.txt 'web/src/**/*.{ts,vue}'
+# 迁移与脚本
+grep -rL 'SPDX-License-Identifier: AGPL-3.0-only' internal/db/migrations scripts \
+  | tee /dev/stderr | (! read)
 ```
 
-**检查清单（每个 PR）：**
+**同时检查版权行**，避免只加 SPDX 忘了版权：
 
-- [ ] 新增的每个源文件都带 AGPL-3.0 header
+```bash
+grep -rL 'Copyright (C) 2026 LiStudioorg' --include='*.go' --include='*.ts' --include='*.vue' . \
+  | grep -v './vendor/' | tee /dev/stderr | (! read)
+```
+
+### 18.4 常见错误
+
+| 错误 | 为什么错 | 正确写法 |
+| --- | --- | --- |
+| `SPDX-License-Identifier: AGPL-3.0` | 不是合法 SPDX 标识符，`AGPL-3.0` 已废弃；语义模糊（only 还是 later？） | `AGPL-3.0-only` |
+| `SPDX-License-Identifier: AGPL-3.0-or-later` | 允许下游用更高版本，**放宽了**我们的授权范围，与项目定位不符 | `AGPL-3.0-only` |
+| `SPDX-License-Identifier: AGPL-3.0+` | `+` 是旧式写法，已被 SPDX 规范弃用 | `AGPL-3.0-only` |
+| `Copyright (C) 2026 LiProxy Contributors` | 版权主体不一致，与其余文件对不上 | `Copyright (C) 2026 LiStudioorg` |
+| 写成 `Copyright 2026 LiStudioorg` | 缺少 `(C)`，各工具解析结果不一 | `Copyright (C) 2026 LiStudioorg` |
+| Go 文件把 header 放在 `//go:build` **之前** | build 约束必须位于文件最前；颠倒后 build tag 失效，且 `gofmt` 会重排报错 | 放在 build tag 之后、`package` 之前 |
+| 只写 SPDX 忘了版权行 | SPDX 只声明许可证，不声明著作权归属 | 两行都要 |
+| 两行后没留空行 | 版权行会被当成紧随内容的注释，Go 下还会误挂到 `package` 的 doc 注释上 | 第三行留空 |
+
+### 18.5 检查清单（每个 PR）
+
+- [ ] 新增的每个源文件都带**两行式 SPDX header**（版权行 + `AGPL-3.0-only`）
+- [ ] SPDX 标识精确为 `AGPL-3.0-only`，没有写成 `AGPL-3.0` / `AGPL-3.0+` / `AGPL-3.0-or-later`
+- [ ] 版权行精确为 `Copyright (C) 2026 LiStudioorg`
+- [ ] Go 文件的 header 在 `//go:build` 之后、`package` 之前
+- [ ] 两行之后有空行
 - [ ] 没有引入专有 / SSPL / BSL / 无许可证的依赖
 - [ ] 新增依赖已在 PR 描述中列出许可证并说明合规性
 - [ ] `LICENSE` 文件未被修改（AGPL-3.0 全文必须逐字保留）
@@ -1354,8 +1369,9 @@ Phase 只定义**边界与出口标准**，不规定实现细节。每个 Phase 
 2. 主配置：liproxy.toml
 3. toml.d/*.toml   按文件名字典序（byte-wise，等价于 sort）
 4. yaml.d/*.yaml   按文件名字典序
-5. state/overrides.toml   仅运行时白名单字段（见 21.6）
 ```
+
+**四级就到此为止。** 没有叠加层、没有第五个来源 —— Web 的编辑会直接落到上面这四级里的某个文件。
 
 两条硬规则：
 
@@ -1436,22 +1452,46 @@ config: invalid value for "inbounds[0].listen": port 0 is not allowed
 - 被覆盖的值要一并列出，否则用户不知道自己在改哪个文件
 - 校验失败**不清空配置**：保留上一份可用 IR 继续运行（见第 12 节）
 
-### 21.6 overrides 白名单
+### 21.6 Web 写配置
 
-`state/overrides.toml` 由 Web 写入，只允许**运行时字段**：
+**Web 可以直接读写配置文件**（主配置、`toml.d/`、`yaml.d/`），但必须走统一的三步写入器。
 
-| 允许 | 不允许 |
+#### 三步写入器
+
+```text
+1. IR 校验    用「当前配置 + 本次改动」编译一次 IR，不通过直接拒绝，不落盘
+2. 备份       把即将被改的文件复制到 backups/，带时间戳；备份失败则中止
+3. 原子替换   写同目录临时文件 → fsync → rename 覆盖，避免读到半个文件
+```
+
+写入后重新加载；若加载因任何原因失败，用第 2 步的备份回滚，并向前端返回错误。三步的顺序不可颠倒，缺一不可。
+
+#### 为什么 Web 直接改配置文件
+
+早期设计让 Web 只能写一个受限的附加层，业务配置一律只读。结果是：用户想在界面上加一个节点、改一条规则，仍然要切回编辑器手写文件 —— Web 界面退化成了仪表盘，而"Web 驱动的代理平台"这个定位落空。
+
+现在反过来：**文件是权威源，Web 是它的一个编辑器**。两条硬约束保证这不会失控：
+
+1. **不存在第二份配置** —— Web 的每次编辑都直接落到那四级加载链里的某个真实文件。用户在 `lip config sources` 里能立刻看到改动落在哪个文件、第几行
+2. **写入永远经过校验与备份** —— 手写文件写错了只是自己麻烦，Web 写错了影响面更大，所以它必须比手写更严格
+
+#### 分层归属
+
+Web 写入时按内容的性质选择文件，不要塞进主配置：
+
+| 内容 | 写到哪 |
 | --- | --- |
-| `log.level` | 任何 `inbounds` / `outbounds` / `nodes` |
-| `runtime.active_node`（当前选中的出站 tag） | 任何 `rules` / `rule_sets` |
-| `runtime.temp_rules`（内存态临时规则） | 任何 `dns` / `providers` / `tls` 配置 |
-| `runtime.mode`（rule / global / direct） | 任何监听地址与端口 |
+| 单条节点、单条规则等增量编辑 | `toml.d/` 下的对应片段文件 |
+| 进程级参数（监听地址、认证、日志级别） | 主配置 `liproxy.toml` |
+| 用户明确指定要改主配置的字段 | 主配置，且必须精确定位到字段，不整文件重写 |
 
-实现要求：
+写片段文件时**只改目标键**，不要重新序列化整个文件 —— 否则用户手写的注释、空行与顺序会全部丢失。这是评判实现是否合格的关键一条。
 
-- 白名单是代码里的**显式 map**，不是"反射后排除业务字段"
-- 写入流程：校验白名单 → 备份到 `backups/` → 临时文件 + `rename` 原子替换 → 重新编译 → 失败则回滚
-- 文件头必须带注释说明"此文件由 Web 生成，业务配置请改主配置或 *.d/"，避免用户误以为这是主配置
+#### 运行时状态不进配置文件
+
+确实需要"随手改一下就生效"的状态（当前选中的出站、临时规则、运行模式），存 `runtime_state` 表，由 Web 读写，**不回写配置文件**。这类状态的特征是：它描述"现在怎么跑"，而不是"应该怎么配"。
+
+区别在于：重启后失效的、用户不介意丢的，是运行时状态；用户希望保留、想进 Git 的，是配置。
 
 ### 21.7 热重载
 
@@ -1460,7 +1500,7 @@ config: invalid value for "inbounds[0].listen": port 0 is not allowed
 | 文件监听（fsnotify 语义，自实现或标准库 + 轮询） | 编辑配置后自动生效 |
 | `SIGHUP` | 容器内、或监听不可靠时的手动触发 |
 | `lip reload` | 通过本地 API 触发 |
-| Web 写 overrides 后 | 同上，走同一套流程 |
+| Web 写入配置文件后 | 同上，走同一套流程 |
 
 流程与约束：
 
@@ -1484,7 +1524,8 @@ config: invalid value for "inbounds[0].listen": port 0 is not allowed
 - **合并语义**：数组追加、map 深合并、同名 outbound 报错并含两个来源行号
 - **双格式同构**：同一份配置分别用 TOML 与 YAML 表达，编译出的 IR 必须**深度相等**
 - **往返**：`load → IR → export → load` 结果一致
-- **overrides 白名单**：写业务字段必须被拒绝
+- **写配置三步器**：IR 校验不过不落盘、备份失败则中止、写入后失败能回滚
+- **片段写入不破坏原文件**：只改目标键，注释与顺序保留
 - **失败保留旧 IR**：坏配置文件不会导致服务不可用
 - **纯函数性**：相同 `FileSet` 编译两次，结果深度相等
 

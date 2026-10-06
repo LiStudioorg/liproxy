@@ -51,11 +51,11 @@ LiProxy 把 Mihomo 级别的客户端能力和 sing-box 级别的服务端能力
 
 ### Web 界面
 
-Web 是**观察台 + 运行时调节器**，不是配置编辑器：
+Web 是**配置编辑器 + 观察台**，和手写文件是同一个权威源的两个入口：
 
-- **只读**：当前生效的 IR、节点、规则、Provider、DNS、连接列表、实时流量曲线、日志
-- **可写**：只写 `state/overrides.toml` 里的运行时字段 —— 切换当前节点、临时规则、日志级别、运行模式
-- **不写**：主配置与 `toml.d/` `yaml.d/` 里的任何文件。你的配置文件只有一个写入者，就是你自己
+- **可写**：直接编辑配置文件 —— 增删节点、改规则、调 DNS、切运行模式。每次写入都经过 **IR 校验 → 备份 → 原子替换**，写坏了能回滚
+- **可读**：当前生效的 IR、配置来源、连接列表、实时流量曲线、运行日志
+- **不藏私**：界面上的每次改动都落在你自己的文件里，`lip config sources` 能指出它写到了哪个文件第几行
 - 支持 PWA，可安装到桌面/手机，离线也能打开面板
 
 配套两条命令，让文件与界面互相印证：
@@ -167,9 +167,8 @@ LiProxy 的配置**就是文件**，没有第二份藏在数据库里。
 ├── yaml.d/               # YAML 片段，按文件名字典序加载
 ├── state/                # 运行时状态（删掉可重建，不是配置）
 │   ├── li.db             #   会话 · API Key · 审计 · 流量 · 订阅缓存
-│   ├── overrides.toml    #   Web 写入的运行时覆盖
 │   └── fakeip.db         #   Fake-IP 映射
-└── backups/              # 自动备份
+└── backups/              # 自动备份（Web 每次写配置前先备份）
 ```
 
 日志只写到 **stdout**，不落盘 —— 收集交给 systemd journal / Docker logging driver。
@@ -184,7 +183,8 @@ LiProxy 的配置**就是文件**，没有第二份藏在数据库里。
 | 2 | `liproxy.toml` **或** `liproxy.yaml` | 二选一；TOML 存在时完全忽略 YAML |
 | 3 | `toml.d/*.toml` | 按文件名字典序 |
 | 4 | `yaml.d/*.yaml` | 按文件名字典序 |
-| 5 | `state/overrides.toml` | Web 写入，**仅运行时白名单字段** |
+
+Web 的编辑直接落到上面四级里的某个文件，**不引入第五个来源**。
 
 > 字典序是逐字节比较，所以 `10-a.toml` 排在 `9-a.toml` **前面**。需要严格顺序就用零填充前缀：`001-`、`002-`。
 
@@ -223,18 +223,28 @@ optional = true
 
 **坏配置不会让服务挂掉。** 某个片段文件写错语法时，LiProxy 会报出该文件与行号，**继续使用上一份可用的配置**继续运行，并在 Web 顶部显示降级告警。你可以在线修好文件，热重载会自动生效。
 
-### overrides 里能写什么
+### Web 能改什么
 
-Web 唯一能写的地方，且只允许这几个字段：
+**Web 直接读写你的配置文件**，和手写文件是同一个权威源的两个入口，不存在第二份配置。
 
-| 允许 | 含义 |
+一个改动会被写到哪，取决于它的性质：
+
+| 改的东西 | 落到哪个文件 |
 | --- | --- |
-| `log.level` | 运行日志级别 |
-| `runtime.mode` | `rule` / `global` / `direct` |
-| `runtime.active_node` | 当前选中的出站 |
-| `runtime.temp_rules` | 内存态临时规则 |
+| 单条节点、单条规则等增量编辑 | `toml.d/` 下的对应片段 |
+| 进程级参数（监听地址、认证、日志级别） | 主配置 `liproxy.toml` |
 
-节点、规则、DNS、监听地址**不在**此列 —— 它们只能来自你的配置文件。
+但 Web 的每次写入都要过三道关，比手写更严格：
+
+1. **IR 校验** —— 用「当前配置 + 本次改动」先编译一次，不通过就直接拒绝，不落盘
+2. **备份** —— 把即将被改的文件复制到 `backups/`（带时间戳），备份失败则中止
+3. **原子替换** —— 写同目录临时文件 → `fsync` → `rename` 覆盖，避免读到半个文件
+
+写入后会重新加载；万一加载失败，用备份回滚并告诉你哪里错了。
+
+写片段文件时只改目标键，**不会重写整个文件** —— 你手写的注释、空行和顺序都会原样保留。
+
+> 分不清某个值到底来自哪个文件？`lip config sources` 会告诉你每个字段来自哪个文件第几行。
 
 ### 完整示例
 
@@ -289,11 +299,11 @@ sudo systemctl restart liproxy
 
 ![dashboard](docs/images/dashboard.png)
 
-Web 是**观察台 + 运行时调节器**，不是配置编辑器：
+Web 是**配置编辑器 + 观察台**，和手写文件是同一个权威源的两个入口：
 
-- **只读**：当前生效的 IR、节点、规则、Provider、DNS、连接列表、实时流量曲线、日志
-- **可写**：只写 `state/overrides.toml` 里的运行时字段 —— 切换当前节点、临时规则、日志级别、运行模式
-- **不写**：主配置与 `toml.d/` `yaml.d/` 里的任何文件。你的配置文件只有一个写入者，就是你自己
+- **可写**：直接编辑配置文件 —— 增删节点、改规则、调 DNS、切运行模式。每次写入都经过 **IR 校验 → 备份 → 原子替换**，写坏了能回滚
+- **可读**：当前生效的 IR、配置来源、连接列表、实时流量曲线、运行日志
+- **不藏私**：界面上的每次改动都落在你自己的文件里，`lip config sources` 能指出它写到了哪个文件第几行
 - 支持 PWA，可安装到桌面/手机，离线也能打开面板
 
 配套两条命令，让文件与界面互相印证：
@@ -308,12 +318,12 @@ lip config sources    # 打印每个字段来自哪个文件、第几行
 
 | 页面 | 预览 |
 | --- | --- |
-| 节点总览（只读） | ![proxies](docs/images/proxies.png) |
+| 节点总览 | ![proxies](docs/images/proxies.png) |
 | 规则查看与命中测试 | ![rules](docs/images/rules.png) |
 | 实时连接 | ![connections](docs/images/connections.png) |
 | DNS 状态 | ![dns](docs/images/dns.png) |
 | 服务端用户与流量 | ![users](docs/images/users.png) |
-| 配置来源与运行时覆盖 | ![config](docs/images/config.png) |
+| 配置来源 | ![config](docs/images/config.png) |
 
 </details>
 
@@ -466,7 +476,7 @@ lip import clash config.yaml --dry-run
 ├── liproxy.yaml     # 主配置的 YAML 版本（与 TOML 二选一）
 ├── toml.d/          # TOML 配置片段
 ├── yaml.d/          # YAML 配置片段
-├── state/           # 运行时状态：数据库、overrides、Fake-IP
+├── state/           # 运行时状态：数据库、Fake-IP
 └── backups/         # 自动备份
 ```
 
@@ -475,8 +485,7 @@ lip import clash config.yaml --dry-run
 | `liproxy.toml` / `liproxy.yaml` | ✅ | **权威源**。改完自动热重载 |
 | `toml.d/` `yaml.d/` | ✅ | **权威源**。拆分配置用，按文件名字典序加载 |
 | `state/` | ⚠️ | 运行时状态，删掉会重建（历史流量与审计随之丢失） |
-| `state/overrides.toml` | ⚠️ | 由 Web 生成，手改会被覆盖。业务配置请改上面的文件 |
-| `backups/` | ❌ | 自动生成 |
+| `backups/` | ✅ | 自动备份。Web 写坏了可以从这里捞回来 |
 
 日志不落盘：LiProxy 只写 stdout，用 `journalctl -u liproxy -f` 或 `docker logs -f liproxy` 查看。
 
@@ -492,7 +501,9 @@ LiProxy 是独立实现，不复用它们的代码。设计目标是客户端能
 
 **Q2：配置到底存在哪？Web 会不会改我的文件？**
 
-存在你自己的文件里 —— `~/.li/liproxy/liproxy.toml` 与 `toml.d/` `yaml.d/`。**Web 不会写这些文件**，它只会写 `state/overrides.toml` 里的运行时字段（切节点、临时规则、日志级别）。这样你可以随时把整个配置目录交给 Git 管理，不会出现"界面上改了一下，diff 里多出一堆看不懂的东西"。
+存在你自己的文件里 —— `~/.li/liproxy/liproxy.toml` 与 `toml.d/` `yaml.d/`。**Web 直接编辑这些文件**，但每次都经过三道关：先用改动后的内容编译一次 IR 校验，再把原文件备份到 `backups/`，最后用「临时文件 + rename」原子替换。任何一步失败都回滚，不会留下半损坏的配置。
+
+所以你用界面改的和手写改的，落在完全相同的文件里。整个配置目录可以随时交给 Git 管理，`git diff` 看到的就是你实际改了什么 —— 没有藏在别处的第二份配置。
 
 节点多了觉得主配置太长，就拆到 `toml.d/nodes.toml`、`toml.d/rules.toml` 里去。TOML 与 YAML 都支持，混着用也行 —— 两种格式最终编译成同一份 IR，行为完全一致。
 
