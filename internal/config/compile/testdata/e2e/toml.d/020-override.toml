@@ -1,0 +1,10 @@
+# Overrides the log level set by the main config.
+
+[log]
+level = "debug"
+
+[[outbounds]]
+tag = "us-node"
+type = "vless"
+server = "us.example"
+port = 443

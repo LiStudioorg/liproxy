@@ -1,0 +1,12 @@
+# Cross-format fragment: YAML contributing to the same configuration.
+
+proxy_groups:
+  - name: auto
+    type: url-test
+    proxies: [us-node, direct]
+    interval: 5m
+
+sniffer:
+  enabled: true
+  timeout: 300ms
+  tls: true

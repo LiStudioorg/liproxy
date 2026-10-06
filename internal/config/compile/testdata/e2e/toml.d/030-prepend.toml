@@ -1,0 +1,7 @@
+# A bypass exception that must be evaluated before the rule above.
+
+[[rules]]
+type = "domain"
+payload = ["bypass.example"]
+target = "direct"
+position = "prepend"

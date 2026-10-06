@@ -4,11 +4,14 @@
 package loader
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/rs/zerolog"
 
 	"github.com/LiStudioorg/liproxy/internal/config/ir"
 )
@@ -106,10 +109,15 @@ func TestLoadIncludeSingleFile(t *testing.T) {
 	if len(set.Files) != 2 {
 		t.Fatalf("want 2 files, got %d (%v)", len(set.Files), loadedPaths(set))
 	}
-	// The included fragment must precede its parent, so that applying the
-	// files in order gives the parent the final say.
-	if got := loadedPaths(set); got[0] != "extra.toml" || got[1] != "main.toml" {
-		t.Errorf("load order = %v, want [extra.toml main.toml]", got)
+	// The including file comes first and the fragment after it, so that
+	// applying the files in order gives the fragment the final say.
+	//
+	// This direction is the five-level precedence rule of AGENTS.md 21.1: the
+	// main config is level 2 and a toml.d/ fragment is level 3, so the
+	// fragment must win. The opposite order made every fragment lose to the
+	// file that included it.
+	if got := loadedPaths(set); got[0] != "main.toml" || got[1] != "extra.toml" {
+		t.Errorf("load order = %v, want [main.toml extra.toml]", got)
 	}
 }
 
@@ -454,5 +462,92 @@ func TestLoadDiamondIncludeLoadsOnce(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("shared.toml loaded %d times, want 1", count)
+	}
+}
+
+// TestLoadWildcardMissLogsWarning verifies the non-fatal diagnostic for an
+// include pattern that matched nothing.
+//
+// The load must still succeed: an empty directory is a legitimate state. The
+// point of the warning is that "matched nothing" stops being
+// indistinguishable from "configuration applied cleanly".
+func TestLoadWildcardMissLogsWarning(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "main.toml")
+	if err := os.WriteFile(main, []byte(`
+include = ["fragments/*.toml"]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf)
+	opts := LoadOptions{Logger: &logger}
+
+	set, err := Load(main, opts)
+	if err != nil {
+		t.Fatalf("a wildcard matching nothing must not fail the load: %v", err)
+	}
+	if len(set.Files) != 1 {
+		t.Fatalf("files = %d, want 1 (only the main config)", len(set.Files))
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "matched no files") {
+		t.Fatalf("no warning was logged for the empty wildcard; got %q", out)
+	}
+	if !strings.Contains(out, "fragments/*.toml") {
+		t.Errorf("warning does not quote the pattern; got %q", out)
+	}
+	if !strings.Contains(out, "main.toml") {
+		t.Errorf("warning does not name the declaring file; got %q", out)
+	}
+}
+
+// TestLoadExcludedToEmptyLogsWarning verifies that a pattern whose every match
+// was excluded is reported distinctly, since that points at an over-broad
+// exclude rather than a mistyped path.
+func TestLoadExcludedToEmptyLogsWarning(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "fragments"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fragments", "a.toml"), []byte("x = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(dir, "main.toml")
+	if err := os.WriteFile(main, []byte(`
+include = ["fragments/*.toml"]
+exclude = ["fragments/*"]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf)
+
+	set, err := Load(main, LoadOptions{Logger: &logger})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(set.Files) != 1 {
+		t.Fatalf("files = %d, want 1", len(set.Files))
+	}
+
+	if out := buf.String(); !strings.Contains(out, "excluded") {
+		t.Fatalf("no exclusion warning was logged; got %q", out)
+	}
+}
+
+// TestLoadWithoutLoggerDoesNotPanic verifies that the default nil logger is
+// safe, so a caller that does not care about warnings needs no setup.
+func TestLoadWithoutLoggerDoesNotPanic(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "main.toml")
+	if err := os.WriteFile(main, []byte(`include = ["nothing/*.toml"]`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(main, LoadOptions{}); err != nil {
+		t.Fatalf("Load with a nil logger: %v", err)
 	}
 }

@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"github.com/LiStudioorg/liproxy/internal/config/ir"
 )
 
@@ -58,6 +60,35 @@ type LoadOptions struct {
 	// must opt in individually with optional = true, so that a typo in a path
 	// is never silently tolerated.
 	AllowMissing bool
+
+	// Logger receives non-fatal diagnostics, currently only the
+	// wildcard-matched-nothing warning. A nil value discards them.
+	//
+	// It is injectable rather than reaching for the global logger so that
+	// tests can assert a warning was emitted without capturing stdout, and so
+	// that a library caller that has its own logging setup is not forced to
+	// route through pkg/log.
+	Logger *zerolog.Logger
+}
+
+// warnInclude emits a non-fatal diagnostic about an include pattern.
+//
+// Warnings never fail a load: an empty directory is a legitimate state, and
+// turning it into an error would break the common case of a directory that is
+// populated later. The value of the warning is purely that it distinguishes
+// "matched nothing" from "silently did nothing".
+func (l *loadState) warnInclude(ref ir.SourceRef, msg, pattern string, matched int) {
+	if l.opts.Logger == nil {
+		return
+	}
+	ev := l.opts.Logger.Warn().
+		Str("path", ref.Path).
+		Int("line", ref.Line).
+		Str("pattern", pattern)
+	if matched > 0 {
+		ev = ev.Int("matched", matched).Int("kept", 0)
+	}
+	ev.Msg(msg)
 }
 
 // withDefaults returns a copy with unset limits filled in.
@@ -194,19 +225,27 @@ func (l *loadState) walk(resolvedPath string, declared ir.Format, chain []ir.Sou
 		l.stack = l.stack[:len(l.stack)-1]
 	}()
 
-	// Order matters: a file's own content is applied before the files it
-	// includes, so that an included fragment is more specific and wins.
-	// Dependencies load depth-first, and each is appended before its parent.
+	// The file itself is recorded *before* descending into its includes, so
+	// that a fragment lands after the file that pulled it in and therefore
+	// wins the merge.
+	//
+	// This is the five-level precedence rule of AGENTS.md 21.1: the main
+	// config is level 2, toml.d/ fragments are level 3. Appending the parent
+	// last — which an earlier version did, on the reasoning that a dependency
+	// must precede its dependent — inverted that, and made every fragment
+	// lose to the file that included it.
+	//
+	// Within a single included directory, the loader already sorts by
+	// byte-wise filename, so the level-3 and level-4 rules hold without this
+	// function doing anything further.
+	l.visited[resolvedPath] = len(l.set.Files)
+	l.set.Files = append(l.set.Files, *file)
+
 	for _, inc := range d.Includes {
 		if err := l.loadInclude(inc, d, dir, file.Ref, depth); err != nil {
 			return err
 		}
 	}
-
-	// The file is recorded after its includes so that Files is in a valid
-	// merge order: every file appears after the ones it depends on.
-	l.visited[resolvedPath] = len(l.set.Files)
-	l.set.Files = append(l.set.Files, *file)
 	return nil
 }
 
@@ -216,14 +255,30 @@ func (l *loadState) loadInclude(inc include, d directives, dir string, ref ir.So
 	// that declared the include rather than the top of the file.
 	ref.Line = inc.Line
 
-	paths, err := expandPattern(dir, inc.Pattern, l.opts.MaxFiles)
+	matches, err := expandPattern(dir, inc.Pattern, l.opts.MaxFiles)
 	if err != nil {
 		return errorAt("include", ref, err, l.stack)
 	}
 
-	paths, err = applyExcludes(paths, d.Excludes, dir, ref, l.stack)
+	paths, err := applyExcludes(matches, d.Excludes, dir, ref, l.stack)
 	if err != nil {
 		return err
+	}
+
+	// A wildcard that matched nothing is legal, but it is also the usual
+	// symptom of a mistyped directory name, and silently contributing zero
+	// keys is indistinguishable from success. Warn so the user can tell
+	// "the include worked and had no files" from "the include never resolved".
+	//
+	// It is reported after exclusion, because a pattern whose every match was
+	// excluded is a different (and more interesting) situation than one that
+	// never matched anything: the first says the exclude is too broad.
+	if len(matches) > 0 && len(paths) == 0 {
+		l.warnInclude(ref, "include pattern matched files but all were excluded",
+			inc.Pattern, len(matches))
+	}
+	if len(matches) == 0 && hasMeta(inc.Pattern) {
+		l.warnInclude(ref, "include pattern matched no files", inc.Pattern, 0)
 	}
 
 	for _, p := range paths {

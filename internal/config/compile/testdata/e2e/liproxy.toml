@@ -1,0 +1,19 @@
+# Main config.
+#
+# include must appear before any [table] header: in TOML a bare key after a
+# header belongs to that header, so writing it below [log] would silently
+# attach it to log instead of the document root.
+
+include = [
+  "toml.d/*.toml",
+  "yaml.d/*.yaml",
+]
+
+mode = "client"
+
+[server]
+listen = "127.0.0.1"
+port = 9090
+
+[log]
+level = "info"

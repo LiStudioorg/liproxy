@@ -1,0 +1,10 @@
+# Lowest-priority fragment: baseline outbound and routing rule.
+
+[[outbounds]]
+tag = "direct"
+type = "direct"
+
+[[rules]]
+type = "domain-suffix"
+payload = ["internal.example"]
+target = "direct"
