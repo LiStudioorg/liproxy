@@ -143,7 +143,7 @@ liproxy/
 │   ├── auth/                    # JWT、Refresh Token、API Key、密码哈希
 │   ├── engine/                  # 运行时引擎：接收 IR、构建实例、热重载、统计上报
 │   └── relay/                   # 转发核心：双向拷贝、splice 零拷贝、超时与统计
-├── web/                         # 前端：Vue 3 + TS + Vite（构建产物 web/dist 嵌入二进制，见第 19 节）
+├── web/                         # 前端：Vue 3 + TS + Vite（待 Phase 2 创建；构建产物 web/dist 嵌入二进制，见第 19 节）
 │   ├── embed.go                 # 唯一持有 //go:embed all:dist 的 Go 文件
 │   ├── dist/                    # 前端构建产物（生成物，不入库；仅保留占位 index.html）
 │   ├── src/
@@ -233,7 +233,7 @@ cmd/lipd ──▶ config ──▶ (IR) ──▶ engine ──▶ registry
 1. 组件命名 `PascalCase.vue`；页面级放 `web/src/pages/`，可复用组件放 `web/src/components/`
 2. 统一 `<script setup lang="ts">`，不写 `export default {}`
 3. **禁止 CDN 引用**；字体、图标、图表资源必须本地打包，不得运行时下载
-4. `web/dist/` 为生成物，不入库；gzip 后总体积 **< 2 MB**（见第 19 节体积红线）
+4. `web/dist/` 为生成物，不入库（前端目录尚未创建，该规则随前端单元生效）；gzip 后总体积 **< 2 MB**（见第 19 节体积红线）
 
 **依赖准入规则：** 新增任何第三方依赖前必须确认三件事 ——（1）许可证与 AGPL-3.0 兼容（宽松协议 MIT/Apache-2.0/BSD/ISC 可直接用，完整对照表见第 18 节；专有、SSPL、BSL、无许可证的一律禁止）；（2）不引入 CGO；（3）二进制体积增量可接受（普通依赖 < 500 KB，网络栈类需单独讨论）。任何违反的依赖必须在 PR 描述中说明理由。
 
@@ -1109,7 +1109,7 @@ set -euo pipefail
 #### 不要求 header 的文件
 
 - 自动生成的代码（如 `go generate` 产物、protobuf 生成文件）
-- `web/dist/` 下的构建产物
+- `web/dist/` 下的构建产物（待前端单元创建）
 - Markdown 文档、`LICENSE`、`.gitignore` 等非源代码文件
 
 ### 18.3 CI 检查
@@ -1169,6 +1169,8 @@ grep -rL 'Copyright (C) 2026 LiStudioorg' --include='*.go' --include='*.ts' --in
 
 ### 19.1 embed 的唯一归属
 
+> **`web/` 目录将在前端单元实现时创建，当前仓库尚未包含。以下规范为待实现目标。**
+
 `//go:embed` 只能出现在**一个**包里：`web/embed.go`。
 
 ```go
@@ -1184,8 +1186,8 @@ var webFS embed.FS
 1. 全仓库**只有 `web/embed.go` 允许出现 `//go:embed`**，其它包一律通过 `web.FS()` 或 `web.Handler()` 获取，禁止各自 embed
 2. 必须用 `all:` 前缀 —— 否则 `_` 与 `.` 开头的文件（Vite 产物里常见）会被静默忽略
 3. `web` 包对外只暴露三个符号：`FS() fs.FS`、`Handler() http.Handler`、`Available() bool`；内部结构体（如 `distFS`）不导出
-4. `web/dist/` 是**生成物**，写进 `.gitignore`，不入库；仓库里只保留 `web/dist/.gitkeep`
-5. **`web/dist/.gitkeep` 必须存在**：`go:embed all:dist` 在目录不存在时是编译期错误，会让 `go build ./...`、`go vet`、CI 的纯后端任务全部失败。占位目录保证"只改后端的人也能编译"
+4. `web/dist/` 是**生成物**，写进 `.gitignore`，不入库；仓库里只保留 `web/dist/.gitkeep`（该文件随前端单元一并创建）
+5. **`web/dist/.gitkeep` 必须存在**（待创建）：`go:embed all:dist` 在目录不存在时是编译期错误，会让 `go build ./...`、`go vet`、CI 的纯后端任务全部失败。占位目录保证"只改后端的人也能编译"
 6. **禁止**在 `CMD`/`Dockerfile`/`Makefile` 里把 dist 复制到二进制旁边作为 fallback —— 单文件承诺不允许有"运行时找文件"的分支
 
 > 开发环境（`LIPROXY_DEV=1` 或 `make dev`）下不经过 embed：Vite dev server 提供前端（5173），Go 只提供 API（9090），由 Vite 的 `server.proxy` 转发 `/api`。两条路互不干扰，生产构建永远走 embed。
