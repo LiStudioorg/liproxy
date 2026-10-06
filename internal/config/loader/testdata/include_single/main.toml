@@ -1,0 +1,5 @@
+# The include sits on line 2 so the test can assert the reported position.
+include = ["frag/extra.toml"]
+
+[log]
+level = "info"

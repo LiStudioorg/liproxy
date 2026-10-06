@@ -1,0 +1,6 @@
+# Minimal YAML entry file with no includes.
+log:
+  level: info
+server:
+  listen: 127.0.0.1
+  port: 9090

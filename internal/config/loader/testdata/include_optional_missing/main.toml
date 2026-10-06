@@ -1,0 +1,5 @@
+# optional include: the fragment is expected to be absent, so loading must
+# succeed and simply contribute nothing.
+[[include]]
+path     = "does-not-exist.toml"
+optional = true
