@@ -1,5 +1,6 @@
 // LiProxy - a web-driven universal proxy platform.
-// Copyright (C) 2026 LiProxy Contributors
+// Copyright (C) 2026 LiStudioorg
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -14,41 +15,60 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Command lipd is the LiProxy daemon: it loads the bootstrap configuration,
-// starts the REST/WebSocket API and the proxy engine, and serves the embedded
-// Web UI.
+// Command lipd is the LiProxy daemon: it loads the configuration, compiles it
+// to IR and runs the proxy engine.
 //
-// Scope note: at this stage lipd only resolves its flags, reports its build
-// identity and (with --check) verifies that the bootstrap file exists. The API
-// server, database and engine are not wired up yet, so --check is a
-// file-presence probe and not yet the full validation described in
-// AGENTS.md section 16. It is deliberately not documented in the README until
-// it validates what the README claims.
+// Scope note: the API server, database and embedded Web UI are not wired up
+// yet. What runs today is the proxy path end to end: configuration files in,
+// live listeners out. --check validates what it can, which now includes
+// compilation rather than only file presence.
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"io/fs"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
+	"github.com/rs/zerolog"
+
+	"github.com/LiStudioorg/liproxy/internal/config/compile"
+	"github.com/LiStudioorg/liproxy/internal/config/ir"
+	"github.com/LiStudioorg/liproxy/internal/config/loader"
+	"github.com/LiStudioorg/liproxy/internal/engine"
 	"github.com/LiStudioorg/liproxy/pkg/log"
 	"github.com/LiStudioorg/liproxy/pkg/version"
+
+	// Protocol registrations. These imports have side effects only, and they
+	// live here rather than in the engine so that building a reduced binary is
+	// a matter of removing a line from this file. The engine, router and relay
+	// must never import a protocol package (AGENTS.md 16, pitfall 2).
+	_ "github.com/LiStudioorg/liproxy/internal/inbound/http"
+	_ "github.com/LiStudioorg/liproxy/internal/outbound/block"
+	_ "github.com/LiStudioorg/liproxy/internal/outbound/direct"
 )
 
 // defaultConfigPath is where lipd looks for liproxy.toml when --config is
-// omitted. It mirrors database.path in the README field table.
+// omitted.
 const defaultConfigPath = "~/.li/liproxy/liproxy.toml"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-// run is main without the process-level concerns, so the flag handling and
-// the --check exit codes can be exercised by tests.
+// run is main without the process-level concerns, so flag handling and exit
+// codes can be exercised by tests.
 func run(args []string, stdout, stderr *os.File) int {
+	return runContext(context.Background(), args, stdout, stderr)
+}
+
+// runContext is run with an injectable parent context, so a test can cancel it
+// instead of signalling the whole test process.
+func runContext(parent context.Context, args []string, stdout, stderr *os.File) int {
 	fs := flag.NewFlagSet("lipd", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -82,51 +102,79 @@ func run(args []string, stdout, stderr *os.File) int {
 		return 1
 	}
 
+	// The loader's non-fatal diagnostics go to the process logger, so a
+	// wildcard that matched nothing or an include filed under a table is
+	// visible without failing the load.
+	loadOpts := loader.LoadOptions{Logger: logger}
+
+	set, err := loader.Load(resolved, loadOpts)
+	if err != nil {
+		logger.Error().Err(err).Str("path", resolved).Msg("failed to load configuration")
+		return 1
+	}
+
+	cfg, err := compile.FromFileSet(set)
+	if err != nil {
+		logger.Error().Err(err).Str("path", resolved).Msg("failed to compile configuration")
+		return 1
+	}
+
 	if *check {
-		if err := checkConfig(resolved); err != nil {
-			logger.Error().Err(err).Str("path", resolved).Msg("config check failed")
-			return 1
-		}
-		logger.Info().Str("path", resolved).Msg("config check passed")
+		logger.Info().
+			Str("path", resolved).
+			Int("files", len(set.Files)).
+			Int("inbounds", len(cfg.Inbounds)).
+			Int("outbounds", len(cfg.Outbounds)).
+			Int("rules", len(cfg.Rules)).
+			Msg("config check passed")
 		return 0
 	}
 
-	// The daemon proper (bootstrap, database, API, engine) lands in later
-	// units. Refusing to start is the honest behaviour: silently exiting 0
-	// would look like a successful run to any supervisor.
-	logger.Error().
-		Str("path", resolved).
-		Msg("lipd cannot start yet: bootstrap, database, API and engine are not implemented")
-	return 1
+	return serve(parent, cfg, logger, stderr)
 }
 
-// checkConfig verifies that the bootstrap file is present and readable. It
-// does not parse the TOML yet; that arrives with internal/bootstrap.
+// serve runs the engine until a signal arrives.
+//
+// The signal context is created here rather than in run so that a test can
+// drive run to completion without signalling the whole test process.
+func serve(parent context.Context, cfg *ir.Config, logger *zerolog.Logger, stderr *os.File) int {
+	eng, err := engine.New(cfg, engine.Options{Logger: logger})
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to build the engine")
+		return 1
+	}
+
+	ctx, stop := signalContext(parent)
+	defer stop()
+
+	logger.Info().Msg("starting")
+	if err := eng.Start(ctx); err != nil {
+		logger.Error().Err(err).Msg("engine stopped with an error")
+		return 1
+	}
+	logger.Info().Msg("stopped")
+	return 0
+}
+
+// checkConfig is retained for callers that only need the file probe.
 func checkConfig(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("bootstrap config not found: %w", err)
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("config not found: %w", err)
 		}
-		return fmt.Errorf("cannot access bootstrap config: %w", err)
+		return fmt.Errorf("cannot access config: %w", err)
 	}
 	if info.IsDir() {
-		return fmt.Errorf("bootstrap config path is a directory, not a file: %s", path)
+		return fmt.Errorf("config path is a directory, not a file: %s", path)
 	}
-	if info.Mode().Perm()&0o400 == 0 {
-		return fmt.Errorf("bootstrap config is not readable by the current user: %s", path)
-	}
-	// A zero-byte file passes the existence probe but can never carry the ten
-	// bootstrap fields, so reject it here rather than at parse time.
 	if info.Size() == 0 {
-		return fmt.Errorf("bootstrap config is empty: %s", path)
+		return fmt.Errorf("config is empty: %s", path)
 	}
 	return nil
 }
 
-// expandPath resolves a leading ~ against the user's home directory. Written
-// here rather than pulled from a dependency because the same expansion will be
-// needed by the bootstrap parser in the next unit and it is a few lines.
+// expandPath resolves a leading ~ against the user's home directory.
 func expandPath(path string) (string, error) {
 	if path == "" {
 		return "", errors.New("config path is empty")
@@ -151,4 +199,9 @@ func hasTildePrefix(path string) bool {
 		return false
 	}
 	return path[1] == '/' || path[1] == filepath.Separator
+}
+
+// signalContext returns a context cancelled by SIGINT or SIGTERM.
+func signalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 }
